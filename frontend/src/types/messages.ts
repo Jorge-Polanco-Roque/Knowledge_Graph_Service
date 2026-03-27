@@ -4,6 +4,8 @@ export interface ChatMessage {
   role: MessageRole;
   content: string;
   timestamp: string;
+  /** Concepts activated at the time this message was generated (assistant only) */
+  concepts?: { id: string; label: string; category: string }[];
 }
 
 export interface WSMessage {

@@ -15,13 +15,9 @@ const CATEGORY_COLORS: Record<string, string> = {
 
 function MessageBubble({ message }: { message: ChatMessage }) {
   const isUser = message.role === 'user';
-  const activatedNodes = useGraphStore((s) => s.activatedNodes);
-  const nodes = useGraphStore((s) => s.nodes);
 
-  // For assistant messages, show recently activated concept tags
-  const conceptTags = !isUser
-    ? nodes.filter((n) => activatedNodes.has(n.id)).slice(0, 6)
-    : [];
+  // Use per-message concepts (static snapshot) instead of global activatedNodes
+  const conceptTags = (!isUser && message.concepts) ? message.concepts.slice(0, 6) : [];
 
   return (
     <motion.div

@@ -94,6 +94,11 @@ class MemoryManager:
                 target_label = rel["target_label"]
                 target_id = self._label_to_id(target_label)
                 rel_type = rel.get("relationship", "related_to")
+                # Validate relationship type — fallback to related_to if LLM invents one
+                valid_rels = {"related_to", "is_a", "part_of", "causes", "has_property",
+                              "used_for", "located_in", "created_by", "depends_on", "opposite_of"}
+                if rel_type not in valid_rels:
+                    rel_type = "related_to"
 
                 if not self.graph.has_node(target_id):
                     # Create the target node too
@@ -117,6 +122,22 @@ class MemoryManager:
                         co_activation_count=1,
                     )
                     self.graph.add_edge(edge)
+
+        # Fuzzy-match extracted concepts against existing graph nodes
+        # so the context includes rich existing knowledge, not just new stubs
+        for concept in concepts:
+            related = self._find_related_nodes(concept["label"], max_results=5)
+            for rid in related:
+                if rid not in activated_ids:
+                    activated_ids.append(rid)
+                    # Boost activation of matched nodes
+                    existing = self.graph.get_node(rid)
+                    if existing:
+                        self.graph.update_node(
+                            rid,
+                            activation=min(1.0, existing.activation + 0.3),
+                            last_activated=_now().isoformat(),
+                        )
 
         # Apply plasticity
         self.plasticity.apply_plasticity(activated_ids)
@@ -147,7 +168,7 @@ class MemoryManager:
 
     def get_context_for_prompt(self, seed_ids: list[str]) -> str:
         """Build a textual context from the active subgraph for the LLM prompt."""
-        nodes, edges, _ = self.spread_and_collect_context(seed_ids)
+        nodes, edges, _ = self.spread_and_collect_context(seed_ids, max_depth=2)
 
         if not nodes:
             return ""
@@ -209,6 +230,32 @@ class MemoryManager:
     def _label_to_id(self, label: str) -> str:
         """Deterministic ID from label."""
         return label.lower().strip().replace(" ", "_")
+
+    def _find_related_nodes(self, label: str, max_results: int = 10) -> list[str]:
+        """Find existing graph nodes whose labels contain the query (fuzzy match).
+
+        This enables the agent to leverage existing knowledge even when the
+        extracted concept label doesn't exactly match a node ID.
+        """
+        query = label.lower().strip()
+        matches: list[tuple[str, float]] = []
+        for node in self.graph.all_nodes():
+            node_label = node.label.lower()
+            # Exact match gets highest score
+            if node_label == query:
+                matches.append((node.id, 3.0 + node.importance))
+            # Node label contains query or query contains node label
+            elif query in node_label or node_label in query:
+                matches.append((node.id, 2.0 + node.importance))
+            # Partial word overlap
+            else:
+                query_words = set(query.split())
+                node_words = set(node_label.split())
+                overlap = query_words & node_words
+                if overlap and len(overlap) / max(len(query_words), 1) >= 0.5:
+                    matches.append((node.id, 1.0 + node.importance))
+        matches.sort(key=lambda x: x[1], reverse=True)
+        return [m[0] for m in matches[:max_results]]
 
     def _enforce_stm_capacity(self) -> None:
         """If STM exceeds capacity, evict lowest-activation nodes or consolidate them."""

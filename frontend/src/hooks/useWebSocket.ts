@@ -36,11 +36,18 @@ export function useWebSocket(userId: string) {
         const { type, data } = msg;
 
         switch (type) {
-          case 'agent_response':
+          case 'agent_response': {
+            // Snapshot activated concepts at response time so tags are static per message
+            const concepts = (data.extracted_concepts || []).map((c: any) => ({
+              id: c.label?.toLowerCase().replace(/\s+/g, '_') || '',
+              label: c.label || '',
+              category: c.category || 'concept',
+            }));
             store.getState().addMessage({
               role: 'assistant',
               content: data.content,
               timestamp: new Date().toISOString(),
+              concepts,
             });
             store.getState().setLoading(false);
             if (data.graph_diff) {
@@ -52,6 +59,7 @@ export function useWebSocket(userId: string) {
               .then((stats) => { if (stats) store.getState().setStats(stats); })
               .catch(() => {});
             break;
+          }
 
           case 'graph_diff':
             store.getState().applyDiff(data as any);

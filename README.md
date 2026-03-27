@@ -37,6 +37,7 @@ The application features a split-view interface: a **3D interactive brain visual
 - **3D Neural Visualization** — Interactive, rotatable 3D graph with cluster detection, color-coded communities, and real-time animation of graph changes
 - **Node Search** — Autocomplete search bar to find and fly to any node in the graph, with cluster color and importance indicators
 - **Markdown Chat** — AI responses rendered with full Markdown support (bold, italic, lists, code blocks, headings)
+- **Intelligent Agent** — Critical thinking system prompt that challenges false premises, grounds responses in graph knowledge via fuzzy concept matching, and validates relationship types
 - **AI-Powered Concept Extraction** — GPT-4o extracts entities, relationships, and semantic meaning from natural conversation
 - **File Ingestion** — Ingest documents (.docx, .pdf, .xlsx, .pptx, .csv, .json, .txt, .md), code files, and images (via GPT-4o vision) to bootstrap your knowledge graph
 - **Real-Time Updates** — WebSocket-driven graph diffs push changes instantly to the frontend

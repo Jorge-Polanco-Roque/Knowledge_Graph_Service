@@ -59,9 +59,16 @@ backend/ (Python + FastAPI)
 - **Collapsed graph fix**: Root cause was 152+ disconnected components all converging to origin with weak charge. Fibonacci sphere initial positions + force timing via onEngineTick + smaller sprites solved it.
 - **Node search**: Search bar (top-left) with autocomplete suggestions, filters by label, shows cluster color and importance. Clicking a suggestion flies the camera to that node.
 - **Chat markdown**: Messages rendered with `react-markdown` — supports bold, italic, lists, code blocks, headings.
+- **Static concept tags**: Each message stores its activated concepts at response time (`ChatMessage.concepts`), not from global state. Tags are immutable per message.
 - **Theme**: Light/Dark toggle, affects background, link opacity, borders
 - **Controls**: Theme toggle, Fit to view, Reset camera, Zoom in/out, Node search
 - **Ports**: Backend=8899, Frontend=3477
+
+### Agent Intelligence (validated through iteration)
+- **System prompt**: Instructs the LLM to think critically, challenge false premises, distinguish known from unknown, and ground responses in graph context.
+- **Fuzzy concept matching**: When the user mentions a concept, `_find_related_nodes()` searches all existing graph nodes by substring and word overlap (not just exact ID match). This ensures the agent uses existing knowledge instead of creating empty stubs.
+- **Relationship validation**: LLM-extracted relationship types are validated against the `RelationshipType` enum; invalid values fallback to `related_to` to prevent Pydantic crashes.
+- **Spreading activation**: Depth=2, min_activation=0.05, factor=0.5. Context built from activated subgraph includes concepts + relationships for the LLM prompt.
 
 ### File Ingestion
 - **inputs/ folder** with typed subfolders: documents, people, projects, knowledge, code, media, conversations, data
