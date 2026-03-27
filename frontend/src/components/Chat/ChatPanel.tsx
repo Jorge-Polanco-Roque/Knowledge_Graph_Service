@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
+import ReactMarkdown from 'react-markdown';
 import { useGraphStore } from '../../hooks/useGraphStore';
 import type { ChatMessage } from '../../types/messages';
 
@@ -64,13 +65,32 @@ function MessageBubble({ message }: { message: ChatMessage }) {
           lineHeight: '1.6',
           color: '#e6edf3',
           wordBreak: 'break-word',
-          whiteSpace: 'pre-wrap',
           boxShadow: isUser
             ? '0 2px 12px rgba(59, 130, 246, 0.2)'
             : '0 2px 8px rgba(0, 0, 0, 0.2)',
         }}
       >
-        {message.content}
+        <ReactMarkdown
+          components={{
+            p: ({ children }) => <p style={{ margin: '0 0 8px 0' }}>{children}</p>,
+            strong: ({ children }) => <strong style={{ fontWeight: 700, color: '#f0f6fc' }}>{children}</strong>,
+            em: ({ children }) => <em>{children}</em>,
+            ul: ({ children }) => <ul style={{ margin: '4px 0', paddingLeft: '20px' }}>{children}</ul>,
+            ol: ({ children }) => <ol style={{ margin: '4px 0', paddingLeft: '20px' }}>{children}</ol>,
+            li: ({ children }) => <li style={{ marginBottom: '2px' }}>{children}</li>,
+            code: ({ children, className }) => {
+              const isBlock = className?.startsWith('language-');
+              return isBlock
+                ? <pre style={{ background: 'rgba(0,0,0,0.3)', borderRadius: '6px', padding: '10px', overflowX: 'auto', fontSize: '12px', margin: '6px 0' }}><code>{children}</code></pre>
+                : <code style={{ background: 'rgba(0,212,255,0.1)', padding: '1px 5px', borderRadius: '4px', fontSize: '12px' }}>{children}</code>;
+            },
+            h1: ({ children }) => <h1 style={{ fontSize: '18px', fontWeight: 700, margin: '8px 0 4px' }}>{children}</h1>,
+            h2: ({ children }) => <h2 style={{ fontSize: '16px', fontWeight: 700, margin: '8px 0 4px' }}>{children}</h2>,
+            h3: ({ children }) => <h3 style={{ fontSize: '15px', fontWeight: 600, margin: '6px 0 4px' }}>{children}</h3>,
+          }}
+        >
+          {message.content}
+        </ReactMarkdown>
       </div>
 
       {/* Concept tags for assistant messages */}

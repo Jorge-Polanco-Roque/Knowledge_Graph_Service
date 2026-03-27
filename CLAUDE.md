@@ -46,16 +46,21 @@ backend/ (Python + FastAPI)
 - **Zustand** — lightweight state management
 
 ### Visualization Decisions (validated through iteration)
-- **Node rendering**: Canvas2D pill textures cached as Three.js Sprites (billboard = always face camera)
-- **Node sizing**: `scale = 5 + importance * 2`, aspect ratio from text width
+- **Node rendering**: Canvas2D pill textures cached as Three.js Sprites (billboard = always face camera, `depthWrite: false`)
+- **Node sizing**: `scale = 2 + importance * 1`, aspect ratio from text width (reduced from 5+imp*2 to prevent overlap)
+- **Initial positions**: Fibonacci sphere layout — deterministic, evenly distributed in 3D, radius scales with node count (`R = max(20, N*0.08)`, ultra compact)
+- **Force timing**: Forces configured via `onEngineTick` on first tick (not `useEffect`) to guarantee they apply before any layout computation. `d3ReheatSimulation()` called once after configuration.
+- **Custom forces**: Cluster force (strength=0.3) groups same-cluster nodes together. Gravity force (strength=0.15) pulls all nodes toward origin to keep clusters close. No custom forces that collapse the graph.
 - **Cluster detection**: NetworkX Louvain community detection (resolution=0.5, min cluster size=3)
 - **Cluster colors**: 16-color palette, nodes colored by cluster not category
-- **Cluster force**: Custom d3 force pulling same-cluster nodes together (strength=0.4)
-- **Layout forces**: charge=-120, link distance=35
+- **Layout forces**: charge=-15, link distance=8, center force (default), `warmupTicks=0` — ultra compact layout
 - **Graph freezes** after 300 cooldown ticks (static after layout settles)
-- **Auto-fit**: zoomToFit on engine stop + delayed fallbacks at 2s and 5s
+- **Auto-fit**: zoomToFit on engine stop + delayed fallbacks at 0.5s, 2s, 5s, 8s (padding=20)
+- **Collapsed graph fix**: Root cause was 152+ disconnected components all converging to origin with weak charge. Fibonacci sphere initial positions + force timing via onEngineTick + smaller sprites solved it.
+- **Node search**: Search bar (top-left) with autocomplete suggestions, filters by label, shows cluster color and importance. Clicking a suggestion flies the camera to that node.
+- **Chat markdown**: Messages rendered with `react-markdown` — supports bold, italic, lists, code blocks, headings.
 - **Theme**: Light/Dark toggle, affects background, link opacity, borders
-- **Controls**: Theme toggle, Fit to view, Reset camera, Zoom in/out
+- **Controls**: Theme toggle, Fit to view, Reset camera, Zoom in/out, Node search
 - **Ports**: Backend=8899, Frontend=3477
 
 ### File Ingestion

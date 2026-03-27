@@ -35,6 +35,8 @@ The application features a split-view interface: a **3D interactive brain visual
 - **Brain Plasticity Model** — Implements Hebbian learning, Long-Term Potentiation (LTP), Long-Term Depression (LTD), synaptic pruning, and spreading activation
 - **Dual Memory System** — Short-Term Memory (STM) for active conversation context and Long-Term Memory (LTM) for persistent knowledge, with consolidation between them
 - **3D Neural Visualization** — Interactive, rotatable 3D graph with cluster detection, color-coded communities, and real-time animation of graph changes
+- **Node Search** — Autocomplete search bar to find and fly to any node in the graph, with cluster color and importance indicators
+- **Markdown Chat** — AI responses rendered with full Markdown support (bold, italic, lists, code blocks, headings)
 - **AI-Powered Concept Extraction** — GPT-4o extracts entities, relationships, and semantic meaning from natural conversation
 - **File Ingestion** — Ingest documents (.docx, .pdf, .xlsx, .pptx, .csv, .json, .txt, .md), code files, and images (via GPT-4o vision) to bootstrap your knowledge graph
 - **Real-Time Updates** — WebSocket-driven graph diffs push changes instantly to the frontend

@@ -89,10 +89,19 @@ function createPillTexture(label: string, color: string, isSTM: boolean): THREE.
   return texture;
 }
 
+// Deterministic hash for stable initial positions
+function hashId(id: string): number {
+  let h = 0;
+  for (let i = 0; i < id.length; i++) h = ((h << 5) - h + id.charCodeAt(i)) | 0;
+  return h;
+}
+
 export function BrainGraph() {
   const fgRef = useRef<ForceGraphMethods | undefined>(undefined);
   const containerRef = useRef<HTMLDivElement>(null);
   const [dimensions, setDimensions] = useState({ width: 800, height: 600 });
+  const [searchQuery, setSearchQuery] = useState('');
+  const [searchFocused, setSearchFocused] = useState(false);
 
   const { colors: themeColors, theme } = useThemeStore();
   const nodes = useGraphStore((s) => s.nodes);
@@ -119,47 +128,49 @@ export function BrainGraph() {
     return '#8b5cf6';
   }, [nodeClusterMap]);
 
-  const graphData = useMemo(() => ({
-    nodes: nodes.map((n) => ({ ...n })) as GraphNode[],
-    links: edges.map((e) => ({ source: e.source, target: e.target, weight: e.weight, relationship: e.relationship })),
-  }), [nodes, edges]);
+  // Fibonacci sphere distribution — deterministic, evenly spaced, stable across re-renders
+  const graphData = useMemo(() => {
+    const N = nodes.length;
+    const R = Math.max(20, N * 0.08); // Radius scales with node count (ultra compact)
+    const golden = (1 + Math.sqrt(5)) / 2;
 
-  // Auto-fit
-  const prevCountRef = useRef(0);
-  useEffect(() => {
-    if (nodes.length > 0 && nodes.length !== prevCountRef.current) {
-      prevCountRef.current = nodes.length;
-      const t1 = setTimeout(() => fgRef.current?.zoomToFit(600, 80), 2000);
-      const t2 = setTimeout(() => fgRef.current?.zoomToFit(600, 80), 5000);
-      return () => { clearTimeout(t1); clearTimeout(t2); };
-    }
-  }, [nodes.length]);
-
-  // Forces
-  useEffect(() => {
-    if (!fgRef.current) return;
-    fgRef.current.d3Force('charge')?.strength(-30);
-    fgRef.current.d3Force('link')?.distance(12);
-
-    // Custom gravity: pull all nodes toward origin
-    const gravityForce = (alpha: number) => {
-      const str = 0.08 * alpha;
-      for (const node of graphData.nodes as any[]) {
-        node.vx = (node.vx || 0) - (node.x || 0) * str;
-        node.vy = (node.vy || 0) - (node.y || 0) * str;
-        node.vz = (node.vz || 0) - (node.z || 0) * str;
-      }
+    return {
+      nodes: nodes.map((n, i) => {
+        // Use index-based Fibonacci sphere for even 3D distribution
+        const theta = 2 * Math.PI * i / golden;
+        const phi = Math.acos(1 - (2 * (i + 0.5)) / Math.max(N, 1));
+        return {
+          ...n,
+          x: R * Math.sin(phi) * Math.cos(theta),
+          y: R * Math.sin(phi) * Math.sin(theta),
+          z: R * Math.cos(phi),
+        };
+      }) as GraphNode[],
+      links: edges.map((e) => ({ source: e.source, target: e.target, weight: e.weight, relationship: e.relationship })),
     };
-    fgRef.current.d3Force('gravity', gravityForce);
-  }, [graphData]);
+  }, [nodes, edges]);
 
-  // Cluster force
-  useEffect(() => {
-    if (!fgRef.current || Object.keys(nodeClusterMap).length === 0) return;
+  // Configure forces on the FIRST simulation tick — guaranteed to run before any layout
+  const forcesVersion = useRef(0);
+  const lastForcesVersion = useRef(-1);
+  // Increment version when deps change so forces get reconfigured
+  useEffect(() => { forcesVersion.current++; }, [graphData.nodes, nodeClusterMap]);
+  const handleEngineTick = useCallback(() => {
+    if (!fgRef.current) return;
+    if (lastForcesVersion.current === forcesVersion.current) return;
+    lastForcesVersion.current = forcesVersion.current;
+
     const fg = fgRef.current;
+    fg.d3Force('charge')?.strength(-15);
+    fg.d3Force('link')?.distance(8);
+    // Center force (default) keeps nodes from flying to infinity
+    fg.d3ReheatSimulation();
+
+    // Cluster force — pulls same-cluster nodes together so "Other" groups up
     const clusterForce = (alpha: number) => {
+      const gNodes = graphData.nodes as any[];
       const centers: Record<number, { x: number; y: number; z: number; count: number }> = {};
-      for (const node of graphData.nodes) {
+      for (const node of gNodes) {
         const cid = nodeClusterMap[node.id];
         if (cid === undefined) continue;
         if (!centers[cid]) centers[cid] = { x: 0, y: 0, z: 0, count: 0 };
@@ -169,32 +180,55 @@ export function BrainGraph() {
         centers[cid].count++;
       }
       for (const cid in centers) { const c = centers[cid]; c.x /= c.count; c.y /= c.count; c.z /= c.count; }
-      const strength = 0.6 * alpha;
-      for (const node of graphData.nodes as any[]) {
+      const str = 0.3 * alpha;
+      for (const node of gNodes) {
         const cid = nodeClusterMap[node.id];
         if (cid === undefined || !centers[cid]) continue;
         const c = centers[cid];
-        node.vx = (node.vx || 0) + (c.x - (node.x || 0)) * strength;
-        node.vy = (node.vy || 0) + (c.y - (node.y || 0)) * strength;
-        node.vz = (node.vz || 0) + (c.z - (node.z || 0)) * strength;
+        node.vx = (node.vx || 0) + (c.x - (node.x || 0)) * str;
+        node.vy = (node.vy || 0) + (c.y - (node.y || 0)) * str;
+        node.vz = (node.vz || 0) + (c.z - (node.z || 0)) * str;
       }
     };
-    fg.d3Force('cluster', clusterForce);
-    return () => { fgRef.current?.d3Force('cluster', null); };
-  }, [nodeClusterMap, graphData.nodes]);
+    fg.d3Force('cluster', clusterForce as any);
+
+    // Gravity — gently pull everything toward origin so clusters stay close
+    const gravityForce = (alpha: number) => {
+      const str = 0.15 * alpha;
+      for (const node of graphData.nodes as any[]) {
+        node.vx = (node.vx || 0) - (node.x || 0) * str;
+        node.vy = (node.vy || 0) - (node.y || 0) * str;
+        node.vz = (node.vz || 0) - (node.z || 0) * str;
+      }
+    };
+    fg.d3Force('gravity', gravityForce as any);
+  }, [graphData.nodes, nodeClusterMap]);
+
+  // Auto-fit camera — fires at multiple points to catch the layout at different stages
+  const prevCountRef = useRef(0);
+  useEffect(() => {
+    if (nodes.length > 0 && nodes.length !== prevCountRef.current) {
+      prevCountRef.current = nodes.length;
+      const fit = () => fgRef.current?.zoomToFit(400, 20);
+      const t1 = setTimeout(fit, 500);
+      const t2 = setTimeout(fit, 2000);
+      const t3 = setTimeout(fit, 5000);
+      const t4 = setTimeout(fit, 8000);
+      return () => { clearTimeout(t1); clearTimeout(t2); clearTimeout(t3); clearTimeout(t4); };
+    }
+  }, [nodes.length]);
 
   // Node Three.js object — billboard sprite with cached pill texture
   const nodeThreeObject = useCallback((node: GraphNode) => {
     const color = getNodeColor(node.id);
     const texture = createPillTexture(node.label, color, node.memory_type === 'stm');
 
-    const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthTest: false });
+    const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false });
     const sprite = new THREE.Sprite(mat);
 
-    // Size proportional to canvas aspect ratio, importance scales slightly
     const canvas = texture.image as HTMLCanvasElement;
     const aspect = canvas.width / canvas.height;
-    const scale = 5 + node.importance * 2;
+    const scale = 2 + node.importance * 1;
     sprite.scale.set(scale * aspect, scale, 1);
 
     return sprite;
@@ -233,23 +267,19 @@ export function BrainGraph() {
     const cluster = clusters.find((c) => c.id === clusterId);
     if (!cluster) return;
 
-    // Find positions of all nodes in this cluster
     const clusterNodes = graphData.nodes.filter((n) => cluster.node_ids.includes(n.id));
     if (clusterNodes.length === 0) return;
 
-    // Compute center
     let cx = 0, cy = 0, cz = 0;
     for (const n of clusterNodes) { cx += (n.x || 0); cy += (n.y || 0); cz += (n.z || 0); }
     cx /= clusterNodes.length; cy /= clusterNodes.length; cz /= clusterNodes.length;
 
-    // Compute radius of cluster
     let maxDist = 0;
     for (const n of clusterNodes) {
       const d = Math.sqrt(((n.x || 0) - cx) ** 2 + ((n.y || 0) - cy) ** 2 + ((n.z || 0) - cz) ** 2);
       if (d > maxDist) maxDist = d;
     }
 
-    // Position camera at distance proportional to cluster size
     const dist = Math.max(maxDist * 2.5, 80);
     fgRef.current.cameraPosition(
       { x: cx, y: cy, z: cz + dist },
@@ -258,8 +288,36 @@ export function BrainGraph() {
     );
   }, [clusters, graphData.nodes]);
 
+  // Search suggestions
+  const searchResults = useMemo(() => {
+    if (!searchQuery.trim()) return [];
+    const q = searchQuery.toLowerCase();
+    return nodes
+      .filter((n) => n.label.toLowerCase().includes(q))
+      .sort((a, b) => {
+        const aStarts = a.label.toLowerCase().startsWith(q) ? 0 : 1;
+        const bStarts = b.label.toLowerCase().startsWith(q) ? 0 : 1;
+        return aStarts - bStarts || b.importance - a.importance;
+      })
+      .slice(0, 8);
+  }, [searchQuery, nodes]);
+
+  const handleSelectNode = useCallback((nodeId: string) => {
+    const fg = fgRef.current;
+    if (!fg) return;
+    const node = graphData.nodes.find((n) => n.id === nodeId);
+    if (!node) return;
+    fg.cameraPosition(
+      { x: (node.x || 0) + 40, y: (node.y || 0) + 20, z: (node.z || 0) + 40 },
+      { x: node.x || 0, y: node.y || 0, z: node.z || 0 },
+      800
+    );
+    setSearchQuery('');
+    setSearchFocused(false);
+  }, [graphData.nodes]);
+
   // Controls
-  const handleZoomToFit = useCallback(() => fgRef.current?.zoomToFit(600, 80), []);
+  const handleZoomToFit = useCallback(() => fgRef.current?.zoomToFit(600, 20), []);
   const handleResetCamera = useCallback(() => fgRef.current?.cameraPosition({ x: 0, y: 0, z: 300 }, { x: 0, y: 0, z: 0 }, 800), []);
   const handleZoomIn = useCallback(() => {
     const cam = fgRef.current?.camera();
@@ -295,6 +353,61 @@ export function BrainGraph() {
         <div style={{ display: 'flex', gap: '12px', fontSize: '11px', color: themeColors.textSecondary }}>
           <span>{nodes.length} nodes</span><span>{edges.length} edges</span>
         </div>
+      </div>
+
+      {/* Search */}
+      <div style={{ position: 'absolute', top: 44, left: 16, zIndex: 20, width: '220px' }}>
+        <div style={{ position: 'relative' }}>
+          <input
+            type="text"
+            value={searchQuery}
+            onChange={(e) => setSearchQuery(e.target.value)}
+            onFocus={() => setSearchFocused(true)}
+            onBlur={() => setTimeout(() => setSearchFocused(false), 200)}
+            placeholder="Search nodes..."
+            style={{
+              width: '100%', padding: '7px 12px 7px 32px', fontSize: '12px',
+              borderRadius: '8px',
+              border: `1px solid ${theme === 'dark' ? 'rgba(0,212,255,0.2)' : 'rgba(0,0,0,0.15)'}`,
+              background: theme === 'dark' ? 'rgba(10,10,26,0.8)' : 'rgba(255,255,255,0.9)',
+              color: theme === 'dark' ? '#e6edf3' : '#1a1a2e',
+              backdropFilter: 'blur(8px)', outline: 'none',
+            }}
+          />
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke={theme === 'dark' ? '#8b949e' : '#6b7280'} strokeWidth="2" style={{ position: 'absolute', left: 10, top: '50%', transform: 'translateY(-50%)' }}>
+            <circle cx="11" cy="11" r="8" /><path d="m21 21-4.3-4.3" />
+          </svg>
+        </div>
+        {searchFocused && searchResults.length > 0 && (
+          <div style={{
+            marginTop: '4px', borderRadius: '8px', overflow: 'hidden',
+            border: `1px solid ${theme === 'dark' ? 'rgba(0,212,255,0.15)' : 'rgba(0,0,0,0.1)'}`,
+            background: theme === 'dark' ? 'rgba(10,10,26,0.95)' : 'rgba(255,255,255,0.95)',
+            backdropFilter: 'blur(8px)', maxHeight: '240px', overflowY: 'auto',
+          }}>
+            {searchResults.map((node) => {
+              const col = getNodeColor(node.id);
+              return (
+                <div
+                  key={node.id}
+                  onMouseDown={() => handleSelectNode(node.id)}
+                  style={{
+                    padding: '6px 12px', cursor: 'pointer', fontSize: '12px',
+                    display: 'flex', alignItems: 'center', gap: '8px',
+                    color: theme === 'dark' ? '#e6edf3' : '#1a1a2e',
+                    transition: 'background 0.1s',
+                  }}
+                  onMouseEnter={(e) => { e.currentTarget.style.background = theme === 'dark' ? 'rgba(0,212,255,0.1)' : 'rgba(99,102,241,0.1)'; }}
+                  onMouseLeave={(e) => { e.currentTarget.style.background = 'transparent'; }}
+                >
+                  <div style={{ width: 8, height: 8, borderRadius: '50%', background: col, flexShrink: 0 }} />
+                  <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' as const }}>{node.label}</span>
+                  <span style={{ marginLeft: 'auto', fontSize: '10px', color: theme === 'dark' ? '#8b949e' : '#9ca3af', flexShrink: 0 }}>{(node.importance * 100).toFixed(0)}%</span>
+                </div>
+              );
+            })}
+          </div>
+        )}
       </div>
 
       {/* Controls */}
@@ -341,12 +454,13 @@ export function BrainGraph() {
         linkDirectionalParticles={1}
         linkDirectionalParticleWidth={1.5}
         linkDirectionalParticleSpeed={0.004}
-        warmupTicks={200}
+        warmupTicks={0}
         cooldownTicks={300}
-        d3AlphaDecay={0.01}
+        d3AlphaDecay={0.02}
         d3VelocityDecay={0.2}
+        onEngineTick={handleEngineTick}
         onNodeDragEnd={(node: any) => { node.fx = node.x; node.fy = node.y; node.fz = node.z; }}
-        onEngineStop={() => { if (fgRef.current && nodes.length > 0) fgRef.current.zoomToFit(600, 80); }}
+        onEngineStop={() => { if (fgRef.current && nodes.length > 0) fgRef.current.zoomToFit(400, 20); }}
       />
 
       {nodes.length === 0 && (
