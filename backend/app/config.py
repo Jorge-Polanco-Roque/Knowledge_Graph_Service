@@ -31,6 +31,12 @@ class Settings(BaseSettings):
     consolidation_threshold: float = 0.7
     spreading_factor: float = 0.5
 
+    # RAG / Document Store
+    rag_chunk_size: int = 600
+    rag_chunk_overlap: int = 100
+    rag_top_k: int = 5
+    rag_embedding_model: str = "text-embedding-3-small"
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "env_file_override": True}
 
 

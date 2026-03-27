@@ -149,8 +149,8 @@ class KnowledgeGraph:
 
         try:
             from networkx.algorithms.community import louvain_communities
-            # Lower resolution = fewer, larger clusters
-            communities = louvain_communities(undirected, weight="weight", resolution=0.5, seed=42)
+            # Higher resolution = more, smaller clusters (scale with edge density)
+            communities = louvain_communities(undirected, weight="weight", resolution=1.5, seed=42)
         except Exception:
             # Fallback: connected components
             communities = list(nx.connected_components(undirected))

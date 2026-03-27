@@ -18,6 +18,7 @@ from langchain_openai import ChatOpenAI
 from ..config import settings
 from ..graph_kb.memory import MemoryManager
 from ..models.graph import EdgeData, GraphDiff, NodeData
+from ..graph_kb.document_store import get_document_store
 from .file_reader import read_file
 
 logger = logging.getLogger(__name__)
@@ -263,6 +264,25 @@ def ingest_file(
 
     # Read the file
     file_data = read_file(file_path)
+
+    # RAG: Store document chunks (text files only, skip images)
+    if file_data["type"] != "image" and file_data.get("content"):
+        content = file_data["content"]
+        if not content.startswith("[Error") and not content.startswith("[Empty"):
+            try:
+                doc_store = get_document_store(user_id)
+                inputs_dir = settings.data_dir.parent / "inputs"
+                try:
+                    relative_folder = str(file_path.parent.relative_to(inputs_dir))
+                except ValueError:
+                    relative_folder = folder_name
+                doc_store.ingest(content, metadata={
+                    "source_file": file_data["filename"],
+                    "folder": relative_folder,
+                    "folder_type": folder_ctx.get("default_category", "general") if folder_ctx else "general",
+                })
+            except Exception as e:
+                logger.warning("RAG ingestion failed for %s: %s", file_path.name, e)
 
     # Extract concepts
     if file_data["type"] == "image":

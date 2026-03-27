@@ -51,7 +51,7 @@ backend/ (Python + FastAPI)
 - **Initial positions**: Fibonacci sphere layout — deterministic, evenly distributed in 3D, radius scales with node count (`R = max(20, N*0.08)`, ultra compact)
 - **Force timing**: Forces configured via `onEngineTick` on first tick (not `useEffect`) to guarantee they apply before any layout computation. `d3ReheatSimulation()` called once after configuration.
 - **Custom forces**: Cluster force (strength=0.3) groups same-cluster nodes together. Gravity force (strength=0.15) pulls all nodes toward origin to keep clusters close. No custom forces that collapse the graph.
-- **Cluster detection**: NetworkX Louvain community detection (resolution=0.5, min cluster size=3)
+- **Cluster detection**: NetworkX Louvain community detection (resolution=1.5, min cluster size=3). Resolution increased from 0.5 to 1.5 to produce more granular clusters after fuzzy matching + RAG ingestion dramatically increased edge count (~3500 edges).
 - **Cluster colors**: 16-color palette, nodes colored by cluster not category
 - **Layout forces**: charge=-15, link distance=8, center force (default), `warmupTicks=0` — ultra compact layout
 - **Graph freezes** after 300 cooldown ticks (static after layout settles)
@@ -76,6 +76,298 @@ backend/ (Python + FastAPI)
 - Custom folders (e.g. AI_Ethics) auto-detected with generic extraction
 - Conversations auto-saved on WebSocket disconnect
 - Supports: .docx, .pdf, .xlsx, .pptx, .csv, .json, .txt, .md, code files, images (GPT-4o vision)
+
+## RAG Implementation Plan (Document-Grounded Retrieval)
+
+### Problem Statement
+
+Currently, when a user asks "what does the document say about fairness in hiring?", the agent can only answer from concept labels and relationships in the knowledge graph (e.g., "Fairness --[related_to]--> Hiring"). **The original document text is discarded after concept extraction.** The agent cannot cite paragraphs, quote evidence, or reference specific sections from the ingested documents.
+
+### Goal
+
+Add a Retrieval-Augmented Generation (RAG) layer that stores document chunks with embeddings, retrieves relevant passages at query time, and injects them into the LLM context alongside the existing graph context. The agent should be able to cite specific text from documents.
+
+### Architecture Overview
+
+```
+INGESTION (enhanced):
+File → Read → Chunk → Embed → Store in ChromaDB
+                 └──→ LLM Extract Concepts → Knowledge Graph (unchanged)
+
+QUERY (enhanced):
+User Message
+     │
+     ├──→ Embed query → ChromaDB similarity search → Top-K chunks
+     │
+     ├──→ Extract concepts → Fuzzy match → Spreading activation → Graph context
+     │
+     └──→ Merge: graph_context + document_chunks → LLM → Response
+```
+
+### Tech Stack Additions
+
+| Component | Library | Why |
+|---|---|---|
+| Vector Store | **ChromaDB** (`chromadb`) | Embedded (no external service), Python-native, persistent, metadata filtering. Mirrors the NetworkX philosophy: self-contained, no infra deps. |
+| Embeddings | **OpenAI `text-embedding-3-small`** via `langchain-openai` | Already have the API key and langchain-openai installed. 1536 dimensions, cheap ($0.02/1M tokens). |
+| Text Splitting | **`langchain-text-splitters`** (`RecursiveCharacterTextSplitter`) | Smart chunking that respects paragraph/sentence boundaries. Already in the LangChain ecosystem. |
+
+### Implementation Plan — 8 Steps
+
+#### Step 1: Add Dependencies
+
+```toml
+# backend/pyproject.toml — add to dependencies
+"chromadb>=1.0.0",
+"langchain-text-splitters>=0.3.0",
+```
+
+No new frontend dependencies required.
+
+#### Step 2: Create Document Store Module
+
+**New file**: `backend/app/graph_kb/document_store.py`
+
+```python
+class DocumentStore:
+    """ChromaDB-backed document chunk storage with semantic search."""
+
+    def __init__(self, user_id: str, data_dir: Path):
+        self._client = chromadb.PersistentClient(path=str(data_dir / "users" / user_id / "chroma"))
+        self._collection = self._client.get_or_create_collection(
+            name="documents",
+            metadata={"hnsw:space": "cosine"},
+        )
+        self._embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+        self._splitter = RecursiveCharacterTextSplitter(
+            chunk_size=600,      # ~150 tokens per chunk
+            chunk_overlap=100,   # continuity between chunks
+            separators=["\n\n", "\n", ". ", " "],
+        )
+
+    def ingest(self, content: str, metadata: dict) -> int:
+        """Chunk, embed, and store a document. Returns number of chunks stored."""
+
+    def search(self, query: str, top_k: int = 5, filter: dict = None) -> list[dict]:
+        """Semantic search. Returns chunks with content, metadata, and distance."""
+
+    def delete_by_source(self, source_file: str) -> None:
+        """Remove all chunks from a specific source file (for re-ingestion)."""
+```
+
+**Chunk metadata schema**:
+```python
+{
+    "source_file": "article_1.docx",      # original filename
+    "folder": "AI_Ethics/Module_1/Sprint_1",  # folder path
+    "folder_type": "documents",            # taxonomy category
+    "chunk_index": 3,                      # position in document
+    "total_chunks": 12,                    # total chunks in document
+    "page": 2,                             # page number (PDF only)
+}
+```
+
+#### Step 3: Integrate into Ingestion Pipeline
+
+**Modify**: `backend/app/ingestion/ingest.py`
+
+In `ingest_file()`, after reading the file content and before/in parallel with concept extraction:
+
+```python
+async def ingest_file(user_id, file_path, folder_context):
+    content, image_b64 = read_file(file_path)
+
+    # NEW: Store document chunks (text files only, not images)
+    if content and not image_b64:
+        doc_store = get_document_store(user_id)
+        doc_store.ingest(content, metadata={
+            "source_file": file_path.name,
+            "folder": str(file_path.parent.relative_to(inputs_dir)),
+            "folder_type": folder_context.get("type", "general"),
+        })
+
+    # EXISTING: Extract concepts for knowledge graph (unchanged)
+    concepts = await extract_concepts_from_content(content, ...)
+    mm.activate_concepts(concepts)
+```
+
+**Key design decision**: Chunking + embedding happens in parallel with concept extraction. They are independent processes — the graph captures structure (entities, relationships), the vector store captures content (paragraphs, evidence).
+
+#### Step 4: Add RAG Retrieval to Agent Pipeline
+
+**Modify**: `backend/app/agent/nodes.py`
+
+Add a new LangGraph node `retrieve_documents` between `activate_memory` and `build_context`:
+
+```
+extract_concepts → activate_memory → retrieve_documents → build_context → generate_response → update_graph
+```
+
+```python
+def retrieve_documents(state: AgentState) -> dict[str, Any]:
+    """Retrieve relevant document chunks via semantic search."""
+    user_id = state["user_id"]
+    messages = state["messages"]
+
+    # Use the latest user message as the search query
+    query = ""
+    for msg in reversed(messages):
+        if msg.role == "user":
+            query = msg.content
+            break
+
+    if not query:
+        return {"document_chunks": []}
+
+    doc_store = get_document_store(user_id)
+    chunks = doc_store.search(query, top_k=5)
+
+    return {"document_chunks": chunks}
+```
+
+**Update `AgentState`**:
+```python
+class AgentState(TypedDict):
+    messages: list[ChatMessage]
+    user_id: str
+    extracted_concepts: list[ExtractedConcept]
+    activated_ids: list[str]
+    graph_context: str
+    document_chunks: list[dict]   # NEW
+    response: str
+    graph_diff: GraphDiff
+    spreading_waves: list[list[str]]
+```
+
+#### Step 5: Merge Graph Context + Document Chunks
+
+**Modify**: `build_context` in `backend/app/agent/nodes.py`
+
+```python
+def build_context(state: AgentState) -> dict[str, Any]:
+    # EXISTING: graph context from spreading activation
+    graph_context = mm.get_context_for_prompt(activated_ids)
+
+    # NEW: document chunk context
+    chunks = state.get("document_chunks", [])
+    if chunks:
+        doc_lines = ["\n## Relevant Document Excerpts\n"]
+        for i, chunk in enumerate(chunks, 1):
+            source = chunk["metadata"].get("source_file", "unknown")
+            folder = chunk["metadata"].get("folder", "")
+            doc_lines.append(f"### [{source}] (from {folder})")
+            doc_lines.append(chunk["content"])
+            doc_lines.append("")  # blank line separator
+        graph_context += "\n".join(doc_lines)
+
+    return {"graph_context": graph_context}
+```
+
+The LLM now receives:
+```
+## Relevant Knowledge Graph Context
+### Concepts:
+- **Fairness** (importance: 0.80, memory: LTM)
+- **Demographic Parity** (importance: 0.65, memory: LTM)
+### Relationships:
+- Fairness --[related_to, strength: 0.45]--> Hiring
+
+## Relevant Document Excerpts
+### [article_3.docx] (from AI_Ethics/Module_1/Sprint_2)
+"Fairness in hiring algorithms requires evaluating disparate impact
+across protected groups. The 80% rule (four-fifths rule) states that
+the selection rate for any group should be at least 80% of the rate
+for the group with the highest selection rate..."
+```
+
+#### Step 6: Update System Prompt
+
+**Modify**: `SYSTEM_PROMPT` in `backend/app/agent/nodes.py`
+
+Add to the Response Guidelines section:
+```
+- When document excerpts are provided, **cite them directly**. Use quotes and reference
+  the source file name. Prefer evidence from documents over general knowledge.
+- Synthesize information across multiple sources when relevant.
+```
+
+#### Step 7: Persistence & Data Layout
+
+```
+data/users/{user_id}/
+├── graph.json          # Knowledge graph (NetworkX, existing)
+└── chroma/             # ChromaDB persistent storage (NEW)
+    ├── chroma.sqlite3   # metadata + document mapping
+    └── *.bin            # HNSW index files
+```
+
+**Storage estimates** for ~60 DOCX files:
+- Avg 5 pages × 500 words = 2500 words per doc → ~5 chunks per doc
+- 60 docs × 5 chunks = ~300 chunks
+- Embedding dimension: 1536 (text-embedding-3-small)
+- ChromaDB storage: ~5 MB (negligible)
+- Embedding API cost: ~300 chunks × 150 tokens = 45K tokens ≈ $0.001
+
+#### Step 8: Graph ↔ Document Cross-Linking (optional enhancement)
+
+Store the source document reference in graph node metadata when a concept is extracted from a specific file:
+
+```python
+node.metadata["source_files"] = ["article_3.docx", "article_5.docx"]
+```
+
+This enables:
+- Click a node in the frontend → see which documents mention it
+- "Show me all documents related to this cluster"
+- Bidirectional navigation: graph → docs, docs → graph
+
+### Chunking Strategy Details
+
+| Parameter | Value | Rationale |
+|---|---|---|
+| `chunk_size` | 600 chars (~150 tokens) | Small enough for precise retrieval, large enough for coherent context |
+| `chunk_overlap` | 100 chars | Prevents splitting mid-sentence, ensures continuity |
+| `separators` | `["\n\n", "\n", ". ", " "]` | Respects document structure: paragraphs > lines > sentences > words |
+| `top_k` | 5 | Balance between context richness and token budget |
+| `embedding_model` | `text-embedding-3-small` | Best cost/performance ratio, 1536 dims, cosine similarity |
+
+### What Changes vs What Stays
+
+| Component | Status |
+|---|---|
+| Knowledge Graph (NetworkX) | **Unchanged** — still extracts concepts and relationships |
+| Plasticity Engine | **Unchanged** — Hebbian, LTP, LTD, pruning still work |
+| Spreading Activation | **Unchanged** — still builds graph context |
+| Fuzzy Concept Matching | **Unchanged** — still activates related nodes |
+| File Reader | **Unchanged** — same parsing for all formats |
+| Concept Extraction LLM call | **Unchanged** — same extraction prompt |
+| Agent Pipeline | **Extended** — new `retrieve_documents` node added |
+| `build_context` | **Extended** — merges graph + document chunks |
+| System Prompt | **Extended** — citation guidelines added |
+| Frontend | **No changes needed** — markdown rendering already handles quotes/citations |
+
+### Files to Create/Modify
+
+| File | Action | Description |
+|---|---|---|
+| `backend/pyproject.toml` | Modify | Add chromadb, langchain-text-splitters |
+| `backend/app/graph_kb/document_store.py` | **Create** | ChromaDB wrapper: ingest, search, delete |
+| `backend/app/ingestion/ingest.py` | Modify | Add chunk+embed step during file ingestion |
+| `backend/app/agent/nodes.py` | Modify | Add `retrieve_documents` node, update `build_context` |
+| `backend/app/agent/state.py` | Modify | Add `document_chunks` to AgentState |
+| `backend/app/agent/graph_agent.py` | Modify | Add `retrieve_documents` to StateGraph |
+| `backend/app/config.py` | Modify | Add RAG settings (chunk_size, top_k, embedding_model) |
+
+### Risk Mitigation
+
+| Risk | Mitigation |
+|---|---|
+| Embedding API cost | text-embedding-3-small is $0.02/1M tokens; 60 docs ≈ $0.001 |
+| ChromaDB disk space | ~5 MB for 300 chunks; negligible |
+| Slow ingestion (embedding) | Batch embedding calls (ChromaDB handles this); async ingestion |
+| Context too large for LLM | Cap document chunks at top_k=5 (~750 tokens); graph context already capped |
+| Re-ingestion duplicates | `delete_by_source()` before re-ingesting same file |
+| Image files (no text) | Skip chunking for images; only concept extraction (already handled) |
 
 ## Brain Plasticity Model
 

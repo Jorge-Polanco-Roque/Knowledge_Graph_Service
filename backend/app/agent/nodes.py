@@ -12,6 +12,7 @@ from ..config import settings
 from ..graph_kb.memory import MemoryManager
 from ..models.graph import GraphDiff
 from ..models.messages import ConceptRelationship, ExtractedConcept
+from ..graph_kb.document_store import get_document_store
 from .state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -162,19 +163,59 @@ def activate_memory(state: AgentState) -> dict[str, Any]:
 
 
 # ------------------------------------------------------------------
+# Node: retrieve_documents
+# ------------------------------------------------------------------
+
+def retrieve_documents(state: AgentState) -> dict[str, Any]:
+    """Retrieve relevant document chunks via semantic search (RAG)."""
+    user_id = state["user_id"]
+    messages = state["messages"]
+
+    # Use the latest user message as the search query
+    query = ""
+    for msg in reversed(messages):
+        if msg.role == "user":
+            query = msg.content
+            break
+
+    if not query:
+        return {"document_chunks": []}
+
+    try:
+        doc_store = get_document_store(user_id)
+        chunks = doc_store.search(query)
+        return {"document_chunks": chunks}
+    except Exception as exc:
+        logger.warning("Document retrieval failed: %s", exc)
+        return {"document_chunks": []}
+
+
+# ------------------------------------------------------------------
 # Node: build_context
 # ------------------------------------------------------------------
 
 def build_context(state: AgentState) -> dict[str, Any]:
-    """Build textual context from the active subgraph for the LLM prompt."""
+    """Build textual context from the active subgraph + document chunks for the LLM prompt."""
     user_id = state["user_id"]
     activated_ids = state.get("activated_ids", [])
 
-    if not activated_ids:
-        return {"graph_context": ""}
+    # Graph context from spreading activation
+    context = ""
+    if activated_ids:
+        mm = _get_memory_manager(user_id)
+        context = mm.get_context_for_prompt(activated_ids)
 
-    mm = _get_memory_manager(user_id)
-    context = mm.get_context_for_prompt(activated_ids)
+    # Append RAG document excerpts
+    chunks = state.get("document_chunks", [])
+    if chunks:
+        doc_lines = ["\n\n## Relevant Document Excerpts\n"]
+        for chunk in chunks:
+            source = chunk["metadata"].get("source_file", "unknown")
+            folder = chunk["metadata"].get("folder", "")
+            doc_lines.append(f"### [{source}] (from {folder})")
+            doc_lines.append(chunk["content"])
+            doc_lines.append("")
+        context += "\n".join(doc_lines)
 
     return {"graph_context": context}
 
@@ -206,6 +247,8 @@ consolidate from short-term to long-term storage.
 ## Response Guidelines
 
 - **Always ground your response in the Knowledge Graph Context above.** Cite specific concepts, relationships, and data from your graph. If the graph has relevant information, USE IT — don't give a generic answer when you have specific knowledge.
+- When document excerpts are provided, **cite them directly**. Use quotes and reference the source file name (e.g., 'According to [article_3.docx]...'). Prefer evidence from documents over general knowledge.
+- Synthesize information across multiple sources when relevant.
 - If the graph context is empty or irrelevant to the question, say so and answer from general knowledge.
 - Be conversational, precise, and insightful. Prioritize accuracy and logical coherence.
 """
