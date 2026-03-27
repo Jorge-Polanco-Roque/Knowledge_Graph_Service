@@ -1,0 +1,53 @@
+{
+  "folders": {
+    "documents": {
+      "description": "General documents, PDFs, reports, articles",
+      "extraction_hint": "Extract key topics, conclusions, entities, and relationships from this document.",
+      "default_category": "concept",
+      "icon": "📄"
+    },
+    "people": {
+      "description": "Information about people — bios, profiles, contacts, org charts",
+      "extraction_hint": "Focus on extracting people (names, roles, organizations), their skills, relationships to other people, and affiliations.",
+      "default_category": "person",
+      "icon": "👤"
+    },
+    "projects": {
+      "description": "Project documentation, specs, plans, roadmaps, requirements",
+      "extraction_hint": "Extract project names, goals, technologies used, team members involved, dependencies, milestones, and relationships between project components.",
+      "default_category": "concept",
+      "icon": "🚀"
+    },
+    "knowledge": {
+      "description": "Learning material — articles, papers, tutorials, notes, books",
+      "extraction_hint": "Extract core concepts, theories, definitions, and their relationships. Focus on building a conceptual hierarchy (is_a, part_of, depends_on).",
+      "default_category": "concept",
+      "icon": "📚"
+    },
+    "code": {
+      "description": "Source code, scripts, configurations, architecture docs",
+      "extraction_hint": "Extract technologies, libraries, design patterns, APIs, modules, and their relationships (depends_on, part_of, used_for).",
+      "default_category": "object",
+      "icon": "💻"
+    },
+    "media": {
+      "description": "Images, diagrams, screenshots, visual content",
+      "extraction_hint": "Describe what you see in detail. Extract all visible concepts, labels, entities, and their spatial or logical relationships.",
+      "default_category": "object",
+      "icon": "🖼️"
+    },
+    "conversations": {
+      "description": "Chat logs, meeting transcripts, interview notes, conversation exports",
+      "extraction_hint": "Extract the participants (as person nodes), topics discussed, decisions made, action items, and relationships between people and topics. Identify who said what about which topic.",
+      "default_category": "event",
+      "icon": "💬"
+    },
+    "data": {
+      "description": "Structured data — CSVs, JSONs, spreadsheets, datasets",
+      "extraction_hint": "Extract the schema/structure, key entities, categories, and patterns in the data. Identify relationships between data fields and real-world concepts.",
+      "default_category": "object",
+      "icon": "📊"
+    }
+  },
+  "root_files_hint": "General content without specific categorization. Extract all meaningful concepts and relationships."
+}

@@ -1,0 +1,66 @@
+@import "tailwindcss";
+
+/* Neural theme variables */
+:root {
+  --bg-primary: #050510;
+  --bg-secondary: #0a0a1a;
+  --bg-surface: rgba(13, 17, 23, 0.8);
+  --border-color: rgba(0, 212, 255, 0.15);
+  --text-primary: #e6edf3;
+  --text-secondary: #8b949e;
+  --accent-blue: #00d4ff;
+  --accent-purple: #8b5cf6;
+  --accent-orange: #f97316;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: 'Inter', -apple-system, system-ui, sans-serif;
+  overflow: hidden;
+  height: 100vh;
+}
+
+#root { height: 100vh; }
+
+/* Custom scrollbar */
+::-webkit-scrollbar { width: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: rgba(139, 92, 246, 0.25);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover { background: rgba(139, 92, 246, 0.45); }
+
+/* Selection */
+::selection {
+  background: rgba(139, 92, 246, 0.3);
+  color: #fff;
+}
+
+/* Placeholder */
+input::placeholder {
+  color: #4a5568;
+}
+
+/* Smooth transitions on interactive elements */
+input, button {
+  transition: all 0.2s ease;
+}
+
+button:active {
+  transform: scale(0.97);
+}
+
+/* Canvas background gradient via CSS */
+canvas {
+  background: radial-gradient(ellipse at center, #0d1025 0%, #050510 70%) !important;
+}
+
+/* Tooltip fix for force-graph */
+.scene-tooltip {
+  pointer-events: none !important;
+  z-index: 1000 !important;
+}
