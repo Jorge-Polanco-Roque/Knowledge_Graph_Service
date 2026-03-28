@@ -2326,6 +2326,540 @@ cd frontend && npm test
 6. **Per-user graphs**: Each user has an isolated knowledge graph stored in `data/users/{user_id}/graph.json`.
 7. **3D as default visualization**: More immersive and brain-like. A 2D toggle can be added later for accessibility.
 
+## Roadmap: 9-Point Improvement Plan
+
+### Priority 1 (High) — Improve the Core
+
+#### R1: Clean Re-ingestion
+
+**Problem**: Current graph data was ingested before critical fixes (cross-linking, sanitization, validation, RAG). Nodes lack `source_files` metadata, residual duplicates exist, some chunks may still be contaminated.
+
+**Procedure**:
+```bash
+# Step 1: Full reset (clears graph + ChromaDB + embedding cache)
+curl -X DELETE http://localhost:8899/api/graph/default-user
+
+# Step 2: Re-ingest all files (with all fixes active)
+curl -X POST http://localhost:8899/api/ingest/default-user
+
+# Step 3: Post-ingestion cleanup
+curl -X POST http://localhost:8899/api/graph/default-user/deduplicate
+curl -X POST http://localhost:8899/api/graph/default-user/prune-ghosts
+curl -X POST http://localhost:8899/api/graph/default-user/summarize-clusters
+```
+
+**What gets fixed**: All nodes get `source_files` metadata (cross-linking active). Relationship validation prevents invalid types. Concept sanitization blocks sensitive terms. Conversations excluded from RAG. Deduplication merges quasi-duplicates. Ghost nodes pruned.
+
+**Files**: None — all endpoints already exist.
+
+**Effort**: 5 minutes (operational, no code changes).
+
+---
+
+#### R2: Chunk Quality — Document Summaries
+
+**Problem**: RAG chunks are 600-char fragments without context. When the user asks "de qué trata article_5?", the RAG returns mid-paragraph fragments instead of a coherent overview. The LLM has to infer the document's theme from snippets.
+
+**Solution**: During ingestion, generate a 2-3 sentence LLM summary per document and store it as a special "summary chunk" in ChromaDB. The RAG retrieval can then return document overviews alongside detail fragments.
+
+**Implementation**:
+
+**Step 1**: In `ingest_file()`, after reading the file content, generate a summary:
+
+```python
+# Generate document summary via LLM
+if content and len(content) > 200:
+    summary_prompt = f"Summarize this document in 2-3 sentences:\n\n{content[:3000]}"
+    summary_response = llm.invoke([{"role": "user", "content": summary_prompt}])
+    doc_summary = summary_response.content.strip()
+else:
+    doc_summary = content[:200]
+```
+
+**Step 2**: Store summary as a special chunk with metadata tag:
+
+```python
+doc_store.ingest_single(
+    content=doc_summary,
+    metadata={
+        "source_file": file_data["filename"],
+        "folder": relative_folder,
+        "chunk_type": "summary",  # Distinguish from regular chunks
+    }
+)
+```
+
+**Step 3**: Add `ingest_single()` method to `DocumentStore`:
+
+```python
+def ingest_single(self, content: str, metadata: dict) -> None:
+    """Store a single piece of content (e.g., document summary) as one chunk."""
+    chunk_id = hashlib.md5(
+        f"{self._user_id}:summary:{metadata.get('source_file','')}".encode()
+    ).hexdigest()
+    embedding = self._embeddings.embed_documents([content])[0]
+    self._collection.upsert(
+        ids=[chunk_id],
+        documents=[content],
+        embeddings=[embedding],
+        metadatas=[metadata],
+    )
+```
+
+**Step 4** (optional): Boost summary chunks in search results. In `search()`, if a summary chunk appears, promote it to the top of results:
+
+```python
+# After search, promote summaries
+results.sort(key=lambda c: (0 if c["metadata"].get("chunk_type") == "summary" else 1, c["distance"]))
+```
+
+**Files to modify**:
+| File | Change |
+|---|---|
+| `backend/app/graph_kb/document_store.py` | Add `ingest_single()` method, optionally boost summaries in `search()` |
+| `backend/app/ingestion/ingest.py` | Generate summary after file read, store via `ingest_single()` |
+
+**Cost**: 1 LLM call per document (~200 tokens in, ~50 tokens out). For 60 documents ≈ $0.02 total.
+
+---
+
+#### R3: Frontend Conversation Persistence
+
+**Problem**: Chat history disappears on page reload. The user loses all conversation context. The backend auto-saves conversations to `inputs/conversations/` on WebSocket disconnect, but the frontend starts fresh.
+
+**Solution**: Persist messages to `localStorage` on every update. Load on page init.
+
+**Implementation**:
+
+**Step 1**: In `useGraphStore.ts`, add persistence to `addMessage` and `appendToLastMessage`:
+
+```typescript
+const STORAGE_KEY = 'neurograph_messages';
+
+// On store creation, load from localStorage
+const savedMessages = JSON.parse(localStorage.getItem(STORAGE_KEY) || '[]');
+
+// In addMessage:
+addMessage: (msg) => set((state) => {
+    const messages = [...state.messages, msg];
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(messages));
+    return { messages };
+}),
+
+// In appendToLastMessage:
+appendToLastMessage: (chunk) => set((state) => {
+    const msgs = [...state.messages];
+    // ... existing logic ...
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(msgs));
+    return { messages: msgs };
+}),
+```
+
+**Step 2**: Initialize store with saved messages:
+
+```typescript
+messages: JSON.parse(localStorage.getItem('neurograph_messages') || '[]'),
+```
+
+**Step 3**: Add a "Clear chat" button in the UI that clears localStorage and messages.
+
+**Files to modify**:
+| File | Change |
+|---|---|
+| `frontend/src/hooks/useGraphStore.ts` | Load/save messages to localStorage |
+| `frontend/src/components/Chat/ChatPanel.tsx` or `InputBar.tsx` | Add "Clear chat" button |
+
+**Effort**: ~30 lines of code. No backend changes.
+
+---
+
+### Priority 2 (Medium) — Improve the UX
+
+#### R4: Click Node → Detail Panel
+
+**Problem**: Nodes in the 3D graph are visual-only. The user can hover for a tooltip but can't drill down into what a concept contains, which documents mention it, or what it's connected to.
+
+**Solution**: Click a node → slide-in panel showing: node details, edges/relationships, source documents, and relevant document chunks.
+
+**Implementation**:
+
+**Step 1**: Add a new REST endpoint:
+
+```python
+@router.get("/api/graph/{user_id}/node/{node_id}")
+async def get_node_detail(user_id: str, node_id: str) -> dict:
+    mm = _get_memory_manager(user_id)
+    node = mm.graph.get_node(node_id)
+    if not node:
+        raise HTTPException(404, "Node not found")
+
+    edges = mm.graph.edges_of_node(node_id)
+    relationships = []
+    for e in edges:
+        other_id = e.target if e.source == node_id else e.source
+        other = mm.graph.get_node(other_id)
+        relationships.append({
+            "node": other.label if other else other_id,
+            "relationship": e.relationship,
+            "weight": e.weight,
+            "direction": "outgoing" if e.source == node_id else "incoming",
+        })
+
+    # Get document chunks from source files
+    chunks = []
+    source_files = node.metadata.get("source_files", [])
+    if source_files:
+        doc_store = get_document_store(user_id)
+        for sf in source_files[:5]:
+            file_chunks = doc_store.search(node.label, top_k=2, where={"source_file": sf})
+            chunks.extend(file_chunks)
+
+    return {
+        "node": node.model_dump(mode="json"),
+        "relationships": relationships[:20],
+        "chunks": [{"content": c["content"], "source": c["metadata"]["source_file"]} for c in chunks[:5]],
+    }
+```
+
+**Step 2**: New React component `NodeDetailPanel.tsx`:
+
+```tsx
+// Slide-in panel from the right side
+// Shows: label, category, importance, memory type, source files
+// Tabs: "Relationships" (list of connected nodes) | "Documents" (relevant chunks)
+// Close button returns to normal view
+```
+
+**Step 3**: In `BrainGraph.tsx`, add `onNodeClick` handler:
+
+```tsx
+onNodeClick={(node) => {
+    setSelectedNodeId(node.id);
+    // Fetch details from /api/graph/{user_id}/node/{node_id}
+}}
+```
+
+**Files to create/modify**:
+| File | Change |
+|---|---|
+| `backend/app/api/routes.py` | Add `GET /api/graph/{user_id}/node/{node_id}` |
+| `frontend/src/components/BrainGraph/NodeDetailPanel.tsx` | **New** — slide-in detail panel |
+| `frontend/src/components/BrainGraph/BrainGraph.tsx` | Add `onNodeClick`, manage selected node state |
+
+---
+
+#### R5: Confidence Indicator
+
+**Problem**: The user can't tell if a response is grounded in documents or generated from general knowledge. Trust requires transparency.
+
+**Solution**: Show a badge on each message: "Based on N documents" or "General knowledge" based on the context that was used.
+
+**Implementation**:
+
+**Step 1**: Backend sends context metadata with each response. In `_run_agent_streaming` (websocket.py), include chunk count in `response_end`:
+
+```python
+# In response_end data:
+"context_info": {
+    "chunks_used": len(state.get("document_chunks", [])),
+    "source_files": list(set(
+        c["metadata"]["source_file"]
+        for c in state.get("document_chunks", [])
+    )),
+    "mode": settings.context_mode,
+    "out_of_domain": not has_established_knowledge,
+}
+```
+
+**Step 2**: Frontend stores context_info per message in `ChatMessage.context_info`.
+
+**Step 3**: In `MessageBubble`, render badge:
+
+```tsx
+{message.context_info && (
+    <div className="confidence-badge">
+        {message.context_info.chunks_used > 0
+            ? `📄 Based on ${message.context_info.chunks_used} documents`
+            : '💭 General knowledge'}
+    </div>
+)}
+```
+
+**Files to modify**:
+| File | Change |
+|---|---|
+| `backend/app/api/websocket.py` | Include `context_info` in `response_end` |
+| `frontend/src/types/messages.ts` | Add `context_info` to `ChatMessage` |
+| `frontend/src/hooks/useWebSocket.ts` | Store `context_info` from `response_end` |
+| `frontend/src/components/Chat/ChatPanel.tsx` | Render confidence badge |
+
+---
+
+#### R6: Export Graph
+
+**Problem**: The knowledge graph is trapped inside the app. Users can't analyze it externally, share it, or back it up.
+
+**Solution**: Button in the frontend that downloads the graph as JSON.
+
+**Implementation**:
+
+**Step 1**: The endpoint already exists: `GET /api/graph/{user_id}` returns the full snapshot. Just need a download button.
+
+**Step 2**: Frontend button in the graph header or controls:
+
+```tsx
+const handleExport = async () => {
+    const resp = await fetch(`/api/graph/${USER_ID}`);
+    const data = await resp.json();
+    const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `neurograph_${USER_ID}_${new Date().toISOString().slice(0,10)}.json`;
+    a.click();
+    URL.revokeObjectURL(url);
+};
+```
+
+**Step 3** (optional): Add CSV export for nodes and edges:
+
+```python
+@router.get("/api/graph/{user_id}/export/csv")
+async def export_csv(user_id: str):
+    # Return ZIP with nodes.csv and edges.csv
+```
+
+**Files to modify**:
+| File | Change |
+|---|---|
+| `frontend/src/components/BrainGraph/BrainGraph.tsx` | Add export button in controls |
+
+**Effort**: ~15 lines of frontend code. No backend changes for JSON export.
+
+---
+
+### Priority 3 (Low) — Scale the Tool
+
+#### R7: Multi-Model Support
+
+**Problem**: Currently hardcoded to OpenAI GPT-4o. Users may want cheaper models for simple queries, or different providers (Anthropic, Ollama for local/private).
+
+**Solution**: Configurable LLM provider via settings. LangChain already abstracts this.
+
+**Implementation**:
+
+**Step 1**: Add settings:
+
+```python
+# config.py
+llm_provider: str = "openai"  # "openai" | "anthropic" | "ollama"
+openai_model: str = "gpt-4o"
+anthropic_model: str = "claude-sonnet-4-20250514"
+anthropic_api_key: str = ""
+ollama_model: str = "llama3"
+ollama_base_url: str = "http://localhost:11434"
+```
+
+**Step 2**: Factory function in `nodes.py`:
+
+```python
+def _get_llm():
+    if settings.llm_provider == "anthropic":
+        from langchain_anthropic import ChatAnthropic
+        return ChatAnthropic(model=settings.anthropic_model, api_key=settings.anthropic_api_key)
+    elif settings.llm_provider == "ollama":
+        from langchain_ollama import ChatOllama
+        return ChatOllama(model=settings.ollama_model, base_url=settings.ollama_base_url)
+    else:
+        return ChatOpenAI(model=settings.openai_model, api_key=settings.openai_api_key, temperature=0.3)
+```
+
+**Step 3**: Add `langchain-anthropic` and `langchain-ollama` as optional dependencies:
+
+```toml
+[project.optional-dependencies]
+anthropic = ["langchain-anthropic>=0.3.0"]
+ollama = ["langchain-ollama>=0.3.0"]
+```
+
+**Files to modify**:
+| File | Change |
+|---|---|
+| `backend/app/config.py` | Add provider settings |
+| `backend/app/agent/nodes.py` | Factory function for LLM |
+| `backend/app/api/websocket.py` | Use factory in streaming path |
+| `backend/pyproject.toml` | Optional dependencies |
+
+**Note**: Embedding model stays OpenAI (text-embedding-3-small) for ChromaDB compatibility. Switching embedding models requires re-ingestion.
+
+---
+
+#### R8: Conversation History Backend
+
+**Problem**: Conversations are auto-saved as markdown files in `inputs/conversations/` on disconnect, but there's no way to list, load, or resume a previous conversation. The REST API accepts `history` but the client has to provide it.
+
+**Solution**: Persist conversations in JSON format. Add endpoints to list and load.
+
+**Implementation**:
+
+**Step 1**: Storage format:
+
+```
+data/users/{user_id}/conversations/
+├── conv_20260327_154718.json
+├── conv_20260328_091200.json
+└── ...
+```
+
+Each file:
+```json
+{
+    "id": "conv_20260327_154718",
+    "started_at": "2026-03-27T15:47:18Z",
+    "messages": [
+        {"role": "user", "content": "...", "timestamp": "..."},
+        {"role": "assistant", "content": "...", "timestamp": "...", "concepts": [...]}
+    ]
+}
+```
+
+**Step 2**: Save on WebSocket disconnect (modify existing `save_conversation`):
+
+```python
+def save_conversation_json(user_id: str, messages: list[dict]) -> Path:
+    conv_dir = settings.data_dir / "users" / user_id / "conversations"
+    conv_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    filepath = conv_dir / f"conv_{timestamp}.json"
+    filepath.write_text(json.dumps({
+        "id": f"conv_{timestamp}",
+        "started_at": timestamp,
+        "messages": messages,
+    }, ensure_ascii=False, indent=2))
+    return filepath
+```
+
+**Step 3**: Add REST endpoints:
+
+```python
+@router.get("/api/conversations/{user_id}")
+async def list_conversations(user_id: str) -> list[dict]:
+    """List all conversations for a user (newest first)."""
+
+@router.get("/api/conversations/{user_id}/{conv_id}")
+async def get_conversation(user_id: str, conv_id: str) -> dict:
+    """Load a specific conversation."""
+
+@router.delete("/api/conversations/{user_id}/{conv_id}")
+async def delete_conversation(user_id: str, conv_id: str) -> dict:
+    """Delete a conversation."""
+```
+
+**Step 4**: Frontend — conversation list sidebar or dropdown in the chat panel. Click to load a previous conversation. "New conversation" button starts fresh.
+
+**Files to create/modify**:
+| File | Change |
+|---|---|
+| `backend/app/api/routes.py` | Add conversation CRUD endpoints |
+| `backend/app/api/websocket.py` | Save as JSON instead of markdown |
+| `frontend/src/components/Chat/ConversationList.tsx` | **New** — conversation history UI |
+| `frontend/src/hooks/useWebSocket.ts` | Load conversation on connect |
+
+---
+
+#### R9: File Upload from Frontend
+
+**Problem**: To ingest new documents, the user must manually copy files to `backend/inputs/`. There's no way to upload from the web UI.
+
+**Solution**: Drag & drop file upload in the frontend. Backend receives files via multipart upload and saves to `inputs/`.
+
+**Implementation**:
+
+**Step 1**: Backend upload endpoint:
+
+```python
+from fastapi import UploadFile, File
+
+@router.post("/api/upload/{user_id}")
+async def upload_file(
+    user_id: str,
+    file: UploadFile = File(...),
+    folder: str = "documents",
+) -> dict:
+    _validate_user_id(user_id)
+    inputs_dir = settings.data_dir.parent / "inputs" / folder
+    inputs_dir.mkdir(parents=True, exist_ok=True)
+
+    # Sanitize filename
+    safe_name = re.sub(r'[^\w\-.]', '_', file.filename)
+    filepath = inputs_dir / safe_name
+
+    # Save file
+    content = await file.read()
+    filepath.write_bytes(content)
+
+    # Optionally auto-ingest
+    result = ingest_file(filepath, user_id, folder_name=folder)
+
+    return {
+        "filename": safe_name,
+        "folder": folder,
+        "size": len(content),
+        "ingestion": {k: v for k, v in result.items() if k != "graph_diff"},
+    }
+```
+
+**Step 2**: Frontend drop zone. In `IngestButton.tsx` or a new `UploadZone.tsx`:
+
+```tsx
+const handleDrop = async (e: DragEvent) => {
+    e.preventDefault();
+    const files = Array.from(e.dataTransfer.files);
+    for (const file of files) {
+        const formData = new FormData();
+        formData.append('file', file);
+        await fetch(`/api/upload/${USER_ID}?folder=documents`, {
+            method: 'POST',
+            body: formData,
+        });
+    }
+    // Refresh graph
+};
+```
+
+**Step 3**: Add visual drop zone with drag-over highlighting, upload progress indicator, and success/error feedback.
+
+**Security considerations**:
+- Max file size: 50MB (configurable)
+- Allowed extensions whitelist: `.docx`, `.pdf`, `.txt`, `.md`, `.csv`, `.json`, `.xlsx`, `.pptx`, `.py`, `.js`, `.ts`, `.png`, `.jpg`
+- Filename sanitization (remove path separators, special chars)
+- Folder parameter validated against known folders
+
+**Files to create/modify**:
+| File | Change |
+|---|---|
+| `backend/app/api/routes.py` | Add `POST /api/upload/{user_id}` endpoint |
+| `frontend/src/components/Chat/UploadZone.tsx` | **New** — drag & drop UI component |
+| `frontend/src/components/Chat/IngestButton.tsx` | Add upload trigger / integrate UploadZone |
+
+---
+
+### Implementation Order & Effort Summary
+
+| # | Plan | Priority | Effort | Backend | Frontend | Dependencies |
+|---|---|---|---|---|---|---|
+| R1 | Clean Re-ingestion | High | 5 min | None (existing endpoints) | None | None |
+| R2 | Document Summaries | High | 2h | `document_store.py`, `ingest.py` | None | None |
+| R3 | Chat Persistence | High | 30 min | None | `useGraphStore.ts` | None |
+| R4 | Node Detail Panel | Medium | 4h | `routes.py` | `NodeDetailPanel.tsx`, `BrainGraph.tsx` | None |
+| R5 | Confidence Indicator | Medium | 2h | `websocket.py` | `ChatPanel.tsx`, `messages.ts` | None |
+| R6 | Export Graph | Medium | 30 min | None | `BrainGraph.tsx` | None |
+| R7 | Multi-Model | Low | 2h | `config.py`, `nodes.py`, `websocket.py` | None | `langchain-anthropic` / `langchain-ollama` |
+| R8 | Conversation History | Low | 4h | `routes.py`, `websocket.py` | `ConversationList.tsx` | None |
+| R9 | File Upload | Low | 3h | `routes.py` | `UploadZone.tsx` | None |
+
+**Total estimated effort**: ~18 hours across all 9 items. R1+R3+R6 can be done in under 1 hour combined.
+
 ## Coding Conventions
 
 - Backend: Python type hints everywhere, async/await for I/O
