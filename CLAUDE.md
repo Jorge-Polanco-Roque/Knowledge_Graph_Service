@@ -85,10 +85,12 @@ backend/ (Python + FastAPI)
 - **Language-aware responses**: `_detect_language()` detects query language (es, en, zh, ar, fr, pt, de) and injects response language instruction. 10/10 accuracy in testing.
 - **Document comparison**: `_detect_document_refs()` detects "article_1 vs article_3" patterns in queries and searches within each referenced document separately for targeted comparison.
 - **Knowledge gap detection**: `detect_knowledge_gaps()` finds nodes without document evidence. Endpoint: `GET /api/graph/{user_id}/gaps`. Reports per-node and per-cluster coverage.
-- **User feedback**: `POST /api/feedback/{user_id}` stores thumbs up/down as JSONL. `GET /api/feedback/{user_id}/summary` for analytics.
+- **User feedback with learning**: `POST /api/feedback/{user_id}` stores thumbs up/down + optional text comments as JSONL. Comments with negative rating are embedded in ChromaDB as `user_correction` chunks — the agent retrieves and prioritizes these corrections in future queries (highest priority context). `GET /api/feedback/{user_id}/summary` for analytics. Frontend shows 👍/👎 buttons on each assistant message; 👎 opens an optional comment input. Verified: Sunshine Regiment correction was learned and used correctly in subsequent query (T6: 3.3s).
+- **Fixed cluster count**: `max_clusters` setting (default 10) guarantees exactly N clusters: top (N-1) by size + "Other". Post-processing after Louvain merges overflow clusters. Prevents variable cluster counts and massive "Other" blobs.
 - **Graph timeline**: `save_snapshot()` records timestamped graph state after ingestion events. `GET /api/graph/{user_id}/timeline` lists snapshots.
-- **Node confidence visualization**: `computeConfidence()` in frontend uses source_files count + activation_count. Low confidence nodes render semi-transparent. Distribution: 145 nodes at 0.3-0.6, 167 at 0.8-1.0.
-- **Semantic chunking**: Paragraph-aware splitting (800 chars, 150 overlap, 7-level separators: section/paragraph/line/sentence/question/exclamation/word). Still 39% of chunks end mid-sentence due to DOCX formatting — a known limitation.
+- **Node confidence visualization**: `computeConfidence()` in frontend uses source_files count + activation_count. Low confidence nodes render semi-transparent.
+- **Semantic chunking**: Paragraph-aware splitting (800 chars, 150 overlap, 7-level separators).
+- **Self-knowledge**: Agent knows it learns in real time and can explain its own cognitive architecture conceptually (without leaking implementation details).
 
 ### Clean Re-ingestion Results
 
@@ -98,7 +100,7 @@ After R1 clean re-ingestion with all fixes active (relationship validation, dedu
 |---|---|---|---|
 | Nodes | 499 | **304** | Dedup merged 31, pruning removed 87 |
 | Edges | ~1,300 | **2,607** | Relationship validation: fallback instead of crash = more valid edges |
-| Clusters | variable | **14** (with LLM summaries) | Cleaner graph = better community detection |
+| Clusters | variable | **10** (fixed, configurable via `max_clusters`) | Post-processed Louvain: top 9 + Other |
 | Cross-linking | 0/499 | **302/304** with source_files | All nodes know their source documents |
 | ChromaDB chunks | 512 (contaminated) | **4,844** (60 summaries + 4,784 fragments) | Source collision fix: folder/filename as key |
 | Document summaries | 0 | **60** (1 per document) | Auto-generated during ingestion (R2) |

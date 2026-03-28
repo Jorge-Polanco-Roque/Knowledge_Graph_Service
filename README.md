@@ -51,9 +51,11 @@ The application features a split-view interface: a **3D interactive brain visual
 - **Document Comparison** — Detects "article_1 vs article_3" references and searches within each document separately for targeted comparison
 - **Knowledge Gap Detection** — Identifies concepts without document evidence. Reports per-node and per-cluster coverage gaps
 - **Node Confidence Visualization** — Low-confidence nodes (few sources, low activation) render semi-transparent in the 3D graph
-- **User Feedback** — Thumbs up/down per response, stored as JSONL with analytics summary endpoint
+- **User Feedback with Learning** — Thumbs up/down + optional text corrections on each response. Corrections are embedded in ChromaDB and retrieved as highest-priority context in future queries — the agent learns from user feedback in real time
+- **Fixed Cluster Count** — Configurable cluster count (default 10). Post-processes Louvain to guarantee exactly N clusters, preventing variable sizing and massive "Other" blobs
 - **Graph Timeline** — Timestamped snapshots on ingestion events for tracking knowledge evolution
-- **Intelligent Agent** — Critical thinking system prompt that challenges false premises, grounds responses in graph knowledge via fuzzy concept matching, and validates relationship types
+- **Self-Aware Agent** — Knows and accurately explains its own cognitive architecture, confirms it learns in real time during conversation. Conceptual descriptions only (no code details leaked). 18/18 exhaustive tests passed
+- **Intelligent Agent** — Critical thinking system prompt that challenges false premises, resists gaslighting, refuses emotional manipulation, and validates all claims against documents
 - **AI-Powered Concept Extraction** — GPT-4o extracts entities, relationships, and semantic meaning from natural conversation
 - **File Ingestion** — Ingest documents (.docx, .pdf, .xlsx, .pptx, .csv, .json, .txt, .md), code files, and images (via GPT-4o vision) with auto-generated document summaries
 - **Real-Time Updates** — WebSocket-driven graph diffs push changes instantly to the frontend
