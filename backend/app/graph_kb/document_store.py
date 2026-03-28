@@ -93,6 +93,22 @@ class DocumentStore:
         )
         return len(chunks)
 
+    def ingest_summary(self, summary: str, metadata: dict[str, Any]) -> None:
+        """Store a document summary as a special chunk (auto-generated during ingestion)."""
+        source_file = metadata.get("source_file", "unknown")
+        chunk_id = hashlib.md5(
+            f"{self._user_id}:summary:{source_file}".encode()
+        ).hexdigest()
+
+        embedding = self._embeddings.embed_documents([summary])[0]
+
+        self._collection.upsert(
+            ids=[chunk_id],
+            documents=[summary],
+            embeddings=[embedding],
+            metadatas=[{**metadata, "chunk_type": "summary"}],
+        )
+
     def search(
         self, query: str, top_k: int | None = None, where: dict | None = None
     ) -> list[dict[str, Any]]:

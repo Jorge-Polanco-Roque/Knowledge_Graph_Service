@@ -279,11 +279,26 @@ def ingest_file(
                     relative_folder = str(file_path.parent.relative_to(inputs_dir))
                 except ValueError:
                     relative_folder = folder_name
-                doc_store.ingest(content, metadata={
+                chunk_metadata = {
                     "source_file": file_data["filename"],
                     "folder": relative_folder,
                     "folder_type": folder_ctx.get("default_category", "general") if folder_ctx else "general",
-                })
+                }
+                doc_store.ingest(content, metadata=chunk_metadata)
+
+                # Auto-generate document summary and store as special chunk
+                if len(content) > 200:
+                    try:
+                        llm = _get_llm()
+                        summary_text = content[:3000]
+                        summary_resp = llm.invoke([{
+                            "role": "user",
+                            "content": f"Summarize this document in 2-3 sentences. Be specific — mention key topics, entities, and conclusions.\n\n{summary_text}",
+                        }])
+                        doc_store.ingest_summary(summary_resp.content.strip(), chunk_metadata)
+                        logger.info("Generated summary for %s", file_data["filename"])
+                    except Exception as e:
+                        logger.warning("Summary generation failed for %s: %s", file_data["filename"], e)
             except Exception as e:
                 logger.warning("RAG ingestion failed for %s: %s", file_path.name, e)
 
