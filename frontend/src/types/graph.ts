@@ -46,6 +46,7 @@ export interface ClusterInfo {
   label: string;
   node_ids: string[];
   size: number;
+  summary?: string;
 }
 
 export interface GraphSnapshot {

@@ -224,11 +224,18 @@ def build_context(state: AgentState) -> dict[str, Any]:
     user_id = state["user_id"]
     activated_ids = state.get("activated_ids", [])
 
-    # Graph context from spreading activation
+    # Extract user query for contextual spreading
+    query = ""
+    for msg in reversed(state.get("messages", [])):
+        if msg.role == "user":
+            query = msg.content
+            break
+
+    # Graph context from contextual spreading activation
     context = ""
     if activated_ids:
         mm = _get_memory_manager(user_id)
-        context = mm.get_context_for_prompt(activated_ids)
+        context = mm.get_context_for_prompt(activated_ids, query=query or None)
 
     # Append RAG document excerpts
     chunks = state.get("document_chunks", [])

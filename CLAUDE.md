@@ -180,6 +180,829 @@ def search_by_sources(self, query: str, source_files: list[str], top_k: int = 3)
 - **Transparency**: Users see source files on hover, building trust in the graph
 - **Bidirectional navigation**: node → docs (via metadata), docs → nodes (via shared source_file key)
 
+## Future Implementation Plans
+
+### Plan A: Semantic Deduplication of Nodes
+
+#### Problem
+
+The graph accumulates quasi-duplicate nodes from different extraction runs: "AI Fairness", "Fairness in AI", "fairness", "Algorithmic Fairness" are 4 nodes that represent the same concept. This fragments knowledge, weakens edge weights (connections are split across duplicates), and bloats the context sent to the LLM.
+
+#### Solution: Embedding-Based Merge
+
+Use the same OpenAI embedding model (`text-embedding-3-small`) to compute cosine similarity between all node labels. Nodes above a similarity threshold are merged into one.
+
+#### Algorithm
+
+```
+1. Embed all node labels → N vectors of 1536 dims
+2. Compute cosine similarity matrix (N×N)
+3. Find pairs where similarity > 0.85
+4. Build merge groups (union-find / connected components)
+5. For each group:
+   a. Pick "primary" node (highest importance)
+   b. For each "secondary" node:
+      - Merge source_files lists
+      - Sum activation_counts
+      - Take max(importance)
+      - Redirect all edges: any edge pointing to/from secondary → point to primary
+      - If redirect creates a duplicate edge, merge weights (keep max)
+      - Delete secondary node
+6. Recalculate clusters
+7. Save graph
+```
+
+#### Implementation — 3 Files
+
+**File 1: `backend/app/graph_kb/deduplication.py` (NEW)**
+
+```python
+class NodeDeduplicator:
+    """Embedding-based node deduplication."""
+
+    def __init__(self, graph: KnowledgeGraph, embedding_model: str = "text-embedding-3-small"):
+        self._graph = graph
+        self._embeddings = OpenAIEmbeddings(model=embedding_model, api_key=settings.openai_api_key)
+
+    def find_duplicates(self, threshold: float = 0.85) -> list[list[str]]:
+        """Return groups of node IDs that are semantically duplicate."""
+        nodes = self._graph.all_nodes()
+        # Skip folder nodes and very short labels
+        candidates = [n for n in nodes if not n.metadata.get("is_folder") and len(n.label) > 2]
+
+        # Batch embed all labels
+        labels = [n.label for n in candidates]
+        embeddings = self._embeddings.embed_documents(labels)
+
+        # Cosine similarity matrix via numpy
+        import numpy as np
+        matrix = np.array(embeddings)
+        norms = np.linalg.norm(matrix, axis=1, keepdims=True)
+        similarity = (matrix @ matrix.T) / (norms @ norms.T + 1e-10)
+
+        # Union-Find to group connected duplicates
+        parent = list(range(len(candidates)))
+        def find(x):
+            while parent[x] != x: parent[x] = parent[parent[x]]; x = parent[x]
+            return x
+        def union(a, b): parent[find(a)] = find(b)
+
+        for i in range(len(candidates)):
+            for j in range(i + 1, len(candidates)):
+                if similarity[i][j] >= threshold:
+                    union(i, j)
+
+        # Collect groups
+        groups: dict[int, list[int]] = {}
+        for i in range(len(candidates)):
+            root = find(i)
+            groups.setdefault(root, []).append(i)
+
+        # Return only groups with 2+ members
+        return [
+            [candidates[i].id for i in group]
+            for group in groups.values()
+            if len(group) > 1
+        ]
+
+    def merge_group(self, node_ids: list[str]) -> str:
+        """Merge a group of duplicate nodes into one. Returns the surviving node ID."""
+        nodes = [self._graph.get_node(nid) for nid in node_ids]
+        nodes = [n for n in nodes if n is not None]
+        if len(nodes) < 2:
+            return node_ids[0]
+
+        # Primary = highest importance
+        primary = max(nodes, key=lambda n: n.importance)
+        secondaries = [n for n in nodes if n.id != primary.id]
+
+        for sec in secondaries:
+            # Merge metadata
+            merged_sources = list(set(
+                primary.metadata.get("source_files", []) +
+                sec.metadata.get("source_files", [])
+            ))
+            self._graph.update_node(primary.id,
+                activation_count=primary.activation_count + sec.activation_count,
+                importance=max(primary.importance, sec.importance),
+                metadata={**primary.metadata, "source_files": merged_sources},
+            )
+
+            # Redirect edges
+            for edge in self._graph.edges_of_node(sec.id):
+                other = edge.target if edge.source == sec.id else edge.source
+                if other == primary.id:
+                    continue  # Skip self-loops
+                # Check if primary already has this edge
+                existing = self._graph.get_edge(primary.id, other) or self._graph.get_edge(other, primary.id)
+                if existing:
+                    # Merge weights
+                    new_weight = min(1.0, max(existing.weight, edge.weight))
+                    self._graph.update_edge(existing.source, existing.target, weight=new_weight)
+                else:
+                    # Redirect edge
+                    new_source = primary.id if edge.source == sec.id else edge.source
+                    new_target = primary.id if edge.target == sec.id else edge.target
+                    self._graph.add_edge(EdgeData(
+                        source=new_source, target=new_target,
+                        weight=edge.weight, relationship=edge.relationship,
+                        co_activation_count=edge.co_activation_count,
+                    ))
+
+            # Delete secondary
+            self._graph.remove_node(sec.id)
+
+        return primary.id
+
+    def deduplicate(self, threshold: float = 0.85) -> dict:
+        """Full deduplication pipeline. Returns stats."""
+        groups = self.find_duplicates(threshold)
+        merged_count = 0
+        for group in groups:
+            self.merge_group(group)
+            merged_count += len(group) - 1
+        return {"groups_found": len(groups), "nodes_merged": merged_count}
+```
+
+**File 2: `backend/app/api/routes.py` — Add endpoint**
+
+```python
+@router.post("/api/graph/{user_id}/deduplicate")
+async def deduplicate_graph(user_id: str, threshold: float = 0.85):
+    mm = MemoryManager(user_id)
+    dedup = NodeDeduplicator(mm.graph)
+    stats = dedup.deduplicate(threshold)
+    mm.save()
+    return stats
+```
+
+**File 3: `backend/app/graph_kb/knowledge_graph.py` — Add `update_edge` and `edges_of_node` if missing**
+
+Need to verify these methods exist; `edges_of_node` already exists, may need `update_edge`.
+
+#### Cost & Performance
+
+| Metric | Value |
+|---|---|
+| Embedding cost | 500 nodes × ~5 tokens/label = 2500 tokens ≈ $0.00005 |
+| Similarity matrix | 500×500 = 250K comparisons, ~10ms with numpy |
+| Merge operations | Depends on duplicates found; typically 50-150 merges |
+| Total time | ~3-5 seconds (dominated by embedding API call) |
+
+#### When to Run
+
+- **After ingestion**: Button in frontend "Deduplicate Graph"
+- **Not during ingestion**: Would slow down file processing
+- **Manual trigger**: POST `/api/graph/{user_id}/deduplicate?threshold=0.85`
+
+---
+
+### Plan B: Cluster Summaries
+
+#### Problem
+
+Clusters contain 20-300 nodes but have no human-readable summary. The cluster label is just the most important node's label (e.g., "AI Systems"), which doesn't describe the cluster's content. The agent has no high-level understanding of what each cluster represents.
+
+#### Solution: LLM-Generated Cluster Summaries
+
+After Louvain clustering, send each cluster's top nodes + relationships + sample document chunks to the LLM for a 2-3 sentence summary.
+
+#### Architecture
+
+```
+Louvain Detection → For each cluster:
+    Top 10 nodes (by importance)
+    + Inter-cluster relationships
+    + Sample chunks from nodes' source_files
+    → LLM: "Summarize this knowledge cluster in 2-3 sentences"
+    → Store summary in ClusterInfo
+    → Send to frontend + use in agent context
+```
+
+#### Implementation — 5 Files
+
+**Step 1: Extend ClusterInfo model**
+
+`backend/app/models/graph.py` — Add `summary` field:
+
+```python
+class ClusterData(BaseModel):
+    id: int
+    label: str
+    node_ids: list[str]
+    size: int
+    summary: str = ""  # NEW: LLM-generated cluster summary
+```
+
+`frontend/src/types/graph.ts` — Add to ClusterInfo:
+
+```typescript
+export interface ClusterInfo {
+  id: number;
+  label: string;
+  node_ids: string[];
+  size: number;
+  summary?: string;  // NEW
+}
+```
+
+**Step 2: Generate summaries after clustering**
+
+`backend/app/graph_kb/knowledge_graph.py` — New method:
+
+```python
+CLUSTER_SUMMARY_PROMPT = """\
+You are summarizing a thematic cluster from a knowledge graph.
+
+Cluster label: {label}
+Top concepts (by importance):
+{concepts}
+
+Key relationships:
+{relationships}
+
+{document_context}
+
+Write a 2-3 sentence summary of what this cluster of knowledge represents.
+Focus on the main theme, key insights, and how the concepts connect.
+Be specific — mention actual concept names.
+"""
+
+async def generate_cluster_summaries(self, doc_store=None) -> None:
+    """Generate LLM summaries for each cluster."""
+    clusters = self.detect_clusters()
+    llm = ChatOpenAI(model=settings.openai_model, api_key=settings.openai_api_key, temperature=0.2)
+
+    for cluster in clusters:
+        if cluster["size"] < 3:
+            continue
+
+        # Get top 10 nodes
+        cluster_nodes = [self.get_node(nid) for nid in cluster["node_ids"]]
+        cluster_nodes = [n for n in cluster_nodes if n]
+        top_nodes = sorted(cluster_nodes, key=lambda n: n.importance, reverse=True)[:10]
+
+        # Get relationships between cluster nodes
+        cluster_id_set = set(cluster["node_ids"])
+        edges = []
+        for nid in cluster["node_ids"][:20]:
+            for edge in self.edges_of_node(nid):
+                if edge.source in cluster_id_set and edge.target in cluster_id_set:
+                    src = self.get_node(edge.source)
+                    tgt = self.get_node(edge.target)
+                    if src and tgt:
+                        edges.append(f"{src.label} --[{edge.relationship}]--> {tgt.label}")
+
+        # Sample document chunks if doc_store available
+        doc_context = ""
+        if doc_store:
+            source_files = set()
+            for n in top_nodes[:5]:
+                source_files.update(n.metadata.get("source_files", []))
+            if source_files:
+                chunks = doc_store.search_by_sources(
+                    cluster["label"], list(source_files)[:3], top_k=2
+                )
+                if chunks:
+                    doc_context = "Sample document excerpts:\n" + "\n".join(
+                        c["content"][:200] for c in chunks
+                    )
+
+        prompt = CLUSTER_SUMMARY_PROMPT.format(
+            label=cluster["label"],
+            concepts="\n".join(f"- {n.label} (importance: {n.importance:.0%})" for n in top_nodes),
+            relationships="\n".join(edges[:10]) if edges else "No direct relationships found.",
+            document_context=doc_context,
+        )
+
+        response = await llm.ainvoke([{"role": "user", "content": prompt}])
+        cluster["summary"] = response.content.strip()
+```
+
+**Step 3: Cache summaries**
+
+Store summaries in `data/users/{user_id}/cluster_summaries.json`. Regenerate only when:
+- Cluster composition changes (compare node_ids hash)
+- User explicitly requests regeneration
+- After deduplication (clusters change)
+
+**Step 4: Use in agent context**
+
+In `build_context()`, prepend cluster summaries before individual concepts:
+
+```python
+## Knowledge Overview (Cluster Summaries)
+- **AI Systems (373 nodes)**: This cluster covers the technical foundations of AI systems...
+- **Equal Opportunity (75 nodes)**: Focuses on fairness metrics and measurement approaches...
+
+## Relevant Knowledge Graph Context
+### Concepts:
+...
+```
+
+This gives the LLM a "30,000 foot view" before diving into specific nodes.
+
+**Step 5: Frontend — show summary in cluster legend tooltip**
+
+In `BrainGraph.tsx`, modify the cluster legend to show summary on hover:
+
+```tsx
+<div title={cluster.summary || ''}>
+  {cluster.label} {cluster.size}
+</div>
+```
+
+Or an expandable section below each cluster in the legend.
+
+#### Cost
+
+| Metric | Value |
+|---|---|
+| LLM calls | 1 per cluster, ~200 tokens input + 60 tokens output |
+| For 10 clusters | ~2600 tokens ≈ $0.01 |
+| Regeneration | Only on cluster change (cached) |
+
+---
+
+### Plan C: Response Visualization in the Graph
+
+#### Problem
+
+When the agent responds, the user can't see which nodes/edges were used as context. The 3D graph is static — there's no visual connection between the chat response and the graph. The brain metaphor breaks because you can't see "which neurons fired."
+
+#### Solution: Highlight Activated Nodes on Each Response
+
+When the agent responds, visually highlight the nodes and edges that were used to build the context. Show a pulse/glow animation that fades over time, making the graph feel alive.
+
+#### Current State (already exists but unused)
+
+- **Backend sends `activated_nodes`** in `GraphDiff.activated_nodes` (list of node IDs)
+- **Backend sends `spreading_activation`** with `waves` (list of node ID lists per depth level)
+- **Frontend stores `activatedNodes`** in Zustand as `Set<string>`
+- **Frontend stores `spreadingWaves`** in Zustand
+- **BUT**: `nodeThreeObject` callback does NOT check `activatedNodes` — all nodes look the same regardless of activation state
+
+#### Implementation — 3 Changes in BrainGraph.tsx
+
+**Change 1: Create activated pill texture variant**
+
+New function `createActivatedPillTexture` — same as `createPillTexture` but with:
+- Brighter background (opacity 1.0 instead of 0.92)
+- Glowing border: 2px solid with the node's color at full opacity
+- Outer glow: larger rounded rect with semi-transparent color behind
+
+```typescript
+function createActivatedPillTexture(label: string, color: string): THREE.CanvasTexture {
+  // Same as createPillTexture but:
+  // - Outer glow: ctx.shadowColor = color, ctx.shadowBlur = 15
+  // - Brighter fill: globalAlpha = 1.0
+  // - Thicker border: lineWidth = 2, strokeStyle = color at full alpha
+  // Cache separately: key = `${label}|${color}|activated`
+}
+```
+
+**Change 2: Modify `nodeThreeObject` to check activation**
+
+```typescript
+const nodeThreeObject = useCallback((node: GraphNode) => {
+  const color = getNodeColor(node.id);
+  const isActivated = activatedNodes.has(node.id);
+
+  const texture = isActivated
+    ? createActivatedPillTexture(node.label, color)
+    : createPillTexture(node.label, color, node.memory_type === 'stm');
+
+  const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false });
+  const sprite = new THREE.Sprite(mat);
+
+  const canvas = texture.image as HTMLCanvasElement;
+  const aspect = canvas.width / canvas.height;
+  // Activated nodes are slightly larger
+  const scale = isActivated ? (3 + node.importance * 1.5) : (2 + node.importance * 1);
+  sprite.scale.set(scale * aspect, scale, 1);
+
+  return sprite;
+}, [getNodeColor, activatedNodes]);  // Add activatedNodes to deps
+```
+
+**Important**: Adding `activatedNodes` to the deps of `nodeThreeObject` means all node objects are recreated when activations change. For 500 nodes this is acceptable (Three.js sprite creation is fast). The texture cache prevents re-drawing canvases.
+
+**Change 3: Auto-clear activations after delay**
+
+```typescript
+// Clear activation highlighting after 8 seconds
+useEffect(() => {
+  if (activatedNodes.size === 0) return;
+  const timer = setTimeout(() => {
+    useGraphStore.setState({ activatedNodes: new Set() });
+  }, 8000);
+  return () => clearTimeout(timer);
+}, [activatedNodes]);
+```
+
+**Change 4: Camera fly-to activated region**
+
+When new activations arrive, optionally fly the camera to the center of the activated nodes:
+
+```typescript
+useEffect(() => {
+  if (activatedNodes.size === 0 || !fgRef.current) return;
+
+  // Compute center of activated nodes
+  const activated = graphData.nodes.filter(n => activatedNodes.has(n.id));
+  if (activated.length === 0) return;
+
+  let cx = 0, cy = 0, cz = 0;
+  for (const n of activated) { cx += (n.x || 0); cy += (n.y || 0); cz += (n.z || 0); }
+  cx /= activated.length; cy /= activated.length; cz /= activated.length;
+
+  // Fly camera to see the activation
+  const dist = Math.max(50, activated.length * 3);
+  fgRef.current.cameraPosition(
+    { x: cx + dist * 0.5, y: cy + dist * 0.3, z: cz + dist },
+    { x: cx, y: cy, z: cz },
+    1000
+  );
+}, [activatedNodes, graphData.nodes]);
+```
+
+#### Visual Effect Timeline
+
+```
+t=0s  User sends message
+t=1-3s Agent processes (loading dots in chat)
+t=3s  Response arrives:
+      → Activated nodes GLOW (bright border, larger scale)
+      → Camera flies to activated region
+      → Spreading waves animate outward
+t=8s  Glow fades (activatedNodes cleared)
+      → Nodes return to normal appearance
+```
+
+#### Performance Considerations
+
+| Concern | Mitigation |
+|---|---|
+| Re-creating all node sprites on activation | Texture cache: only new textures for ~20 activated nodes. Existing cached textures reused for the other ~480 |
+| Camera animation during interaction | Only flies to activation region, not a full reset. User can still rotate/zoom during animation |
+| Memory from activated textures | Activated textures are cached with `|activated` key suffix. Max ~50 extra textures = ~5MB |
+
+#### Files to Modify
+
+| File | Change |
+|---|---|
+| `frontend/src/components/BrainGraph/BrainGraph.tsx` | `createActivatedPillTexture`, modify `nodeThreeObject`, add activation clear timer, add camera fly-to |
+
+No backend changes needed — the activation data is already sent via WebSocket.
+
+---
+
+### Plan D: Contextual Spreading Activation
+
+#### Problem
+
+The current spreading activation treats all edges equally regardless of what the user asked. When the user asks "How does fairness impact hiring practices?", activation spreads from "fairness" to ALL neighbors with the same formula:
+
+```
+spread_value = parent_activation × edge_weight × SPREADING_FACTOR
+```
+
+This means "fairness → EU AI Act" gets the same treatment as "fairness → hiring discrimination", even though only the latter is relevant to the query. The agent ends up with a context full of tangentially related concepts that dilute the answer quality.
+
+In the brain, attention modulates which neural pathways activate. The same neuron (concept) can activate different downstream pathways depending on the current cognitive task. This is what's missing.
+
+#### Solution: Query-Weighted Spreading
+
+Modulate the spreading factor by the **semantic similarity between the user's query and each candidate neighbor**. Nodes that are semantically related to the query get stronger activation; irrelevant neighbors get dampened.
+
+**New formula:**
+
+```
+context_factor = 0.3 + 0.7 × cosine_similarity(query_embedding, neighbor_embedding)
+spread_value = parent_activation × edge_weight × SPREADING_FACTOR × context_factor
+```
+
+The `0.3 + 0.7 × similarity` mapping ensures:
+- Minimum factor = 0.3 (even irrelevant neighbors get some activation — preserves serendipitous discovery)
+- Maximum factor = 1.0 (highly relevant neighbors get full activation)
+- The query "steers" which pathways light up
+
+**Example — Query: "How does fairness impact hiring?"**
+
+From seed "fairness" (activation=1.0):
+
+| Neighbor | edge_weight | query_similarity | context_factor | spread_value |
+|---|---|---|---|---|
+| hiring discrimination | 0.4 | 0.92 | 0.94 | 1.0 × 0.4 × 0.5 × 0.94 = **0.188** |
+| demographic parity | 0.5 | 0.65 | 0.76 | 1.0 × 0.5 × 0.5 × 0.76 = **0.190** |
+| bias | 0.4 | 0.70 | 0.79 | 1.0 × 0.4 × 0.5 × 0.79 = **0.158** |
+| EU AI Act | 0.3 | 0.30 | 0.51 | 1.0 × 0.3 × 0.5 × 0.51 = **0.077** |
+| machine learning | 0.2 | 0.25 | 0.48 | 1.0 × 0.2 × 0.5 × 0.48 = **0.048** (below threshold!) |
+
+Result: "machine learning" gets pruned, "EU AI Act" barely activates, but "hiring discrimination" and "demographic parity" get strong activation. The context sent to the LLM is focused on what matters for THIS specific question.
+
+#### Architecture: Node Embedding Cache
+
+To avoid calling the embedding API for every node during every query, pre-compute and cache all node label embeddings:
+
+```
+data/users/{user_id}/
+├── graph.json              # Knowledge graph
+├── chroma/                 # Document chunks (RAG)
+└── node_embeddings.npz     # Cached node label embeddings (NEW)
+```
+
+**Cache structure** (numpy .npz file):
+```python
+{
+    "ids": np.array(["fairness", "bias", "hiring", ...]),      # node IDs, shape (N,)
+    "embeddings": np.array([[0.012, -0.034, ...], ...]),        # shape (N, 1536)
+    "version": hash(sorted(node_ids))                           # cache invalidation key
+}
+```
+
+**Cache invalidation**: Rebuild when `hash(sorted(current_node_ids)) != cached_version`. This happens when nodes are added, removed, or merged (deduplication). The rebuild is one batch API call (~500 labels = ~2500 tokens ≈ $0.00005).
+
+**At query time**: Only ONE embedding call (the user's query). All similarity computations are numpy dot products (microseconds for 500 nodes).
+
+#### Implementation — 5 Steps
+
+**Step 1: Create `NodeEmbeddingCache`**
+
+**New file**: `backend/app/graph_kb/embedding_cache.py`
+
+```python
+class NodeEmbeddingCache:
+    """Persistent cache for node label embeddings."""
+
+    def __init__(self, user_id: str, data_dir: Path):
+        self._path = data_dir / "users" / user_id / "node_embeddings.npz"
+        self._embeddings_model = OpenAIEmbeddings(
+            model=settings.rag_embedding_model,
+            api_key=settings.openai_api_key,
+        )
+        self._ids: np.ndarray | None = None
+        self._embeddings: np.ndarray | None = None
+        self._version: str = ""
+        self._load()
+
+    def _load(self) -> None:
+        """Load cache from disk if it exists."""
+        if self._path.exists():
+            data = np.load(self._path, allow_pickle=True)
+            self._ids = data["ids"]
+            self._embeddings = data["embeddings"]
+            self._version = str(data["version"])
+
+    def _save(self) -> None:
+        """Persist cache to disk."""
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(self._path,
+            ids=self._ids,
+            embeddings=self._embeddings,
+            version=self._version,
+        )
+
+    def _compute_version(self, node_ids: list[str]) -> str:
+        """Hash of sorted node IDs for cache invalidation."""
+        import hashlib
+        return hashlib.md5(",".join(sorted(node_ids)).encode()).hexdigest()
+
+    def ensure_fresh(self, graph: KnowledgeGraph) -> None:
+        """Rebuild cache if stale (nodes added/removed since last build)."""
+        all_nodes = graph.all_nodes()
+        current_ids = [n.id for n in all_nodes if not n.metadata.get("is_folder")]
+        current_version = self._compute_version(current_ids)
+
+        if current_version == self._version and self._embeddings is not None:
+            return  # Cache is fresh
+
+        # Rebuild: batch embed all node labels
+        labels = []
+        ids = []
+        for n in all_nodes:
+            if not n.metadata.get("is_folder") and len(n.label) > 1:
+                labels.append(n.label)
+                ids.append(n.id)
+
+        if not labels:
+            self._ids = np.array([])
+            self._embeddings = np.zeros((0, 1536))
+            self._version = current_version
+            self._save()
+            return
+
+        raw_embeddings = self._embeddings_model.embed_documents(labels)
+        self._ids = np.array(ids)
+        self._embeddings = np.array(raw_embeddings)
+        self._version = current_version
+        self._save()
+        logger.info("Rebuilt embedding cache: %d nodes for version %s", len(ids), current_version[:8])
+
+    def get_similarities(self, query: str) -> dict[str, float]:
+        """Compute cosine similarity between query and all cached node labels.
+
+        Returns: {node_id: similarity} for all cached nodes.
+        """
+        if self._embeddings is None or len(self._embeddings) == 0:
+            return {}
+
+        query_embedding = np.array(self._embeddings_model.embed_query(query))
+
+        # Cosine similarity: dot(q, E) / (||q|| * ||E||)
+        norms = np.linalg.norm(self._embeddings, axis=1)
+        query_norm = np.linalg.norm(query_embedding)
+        if query_norm == 0:
+            return {}
+
+        similarities = (self._embeddings @ query_embedding) / (norms * query_norm + 1e-10)
+
+        return {self._ids[i]: float(similarities[i]) for i in range(len(self._ids))}
+```
+
+**Step 2: Modify `SpreadingActivation` to accept query similarities**
+
+**Modify**: `backend/app/graph_kb/spreading.py`
+
+Add an optional `query_similarities` parameter to `spread()`:
+
+```python
+def spread(
+    self,
+    seed_ids: list[str],
+    max_depth: int = 2,
+    min_activation: float = 0.05,
+    query_similarities: dict[str, float] | None = None,  # NEW
+) -> tuple[dict[str, float], list[list[str]]]:
+
+    # ... inside the loop:
+    for edge in self.graph.edges_of_node(node_id):
+        neighbor_id = edge.target if edge.source == node_id else edge.source
+        if neighbor_id in visited:
+            continue
+
+        # Query-weighted context factor
+        if query_similarities and neighbor_id in query_similarities:
+            sim = query_similarities[neighbor_id]
+            context_factor = 0.3 + 0.7 * max(0.0, sim)
+        else:
+            context_factor = 1.0  # No query info → uniform spreading
+
+        spread_value = parent_activation * edge.weight * settings.spreading_factor * context_factor
+        # ...
+```
+
+When `query_similarities` is `None` (e.g., during ingestion or non-query spreading), the behavior is identical to the current implementation (`context_factor = 1.0`). This ensures backward compatibility.
+
+**Step 3: Thread the query through the pipeline**
+
+The user's query needs to flow from `build_context` → `get_context_for_prompt` → `spread_and_collect_context` → `spread()`.
+
+**Modify**: `backend/app/graph_kb/memory.py`
+
+```python
+def spread_and_collect_context(
+    self, seed_ids: list[str], max_depth: int = 2, query: str | None = None,
+) -> tuple[list[NodeData], list[EdgeData], list[list[str]]]:
+    """Spread activation from seeds, optionally weighted by query relevance."""
+
+    query_similarities = None
+    if query:
+        from .embedding_cache import get_embedding_cache
+        cache = get_embedding_cache(self.user_id)
+        cache.ensure_fresh(self.graph)
+        query_similarities = cache.get_similarities(query)
+
+    activations, waves = self.spreading.spread(
+        seed_ids, max_depth=max_depth, query_similarities=query_similarities,
+    )
+    relevant_ids = list(activations.keys())
+    sub = self.graph.subgraph(relevant_ids)
+    return sub.nodes, sub.edges, waves
+
+
+def get_context_for_prompt(self, seed_ids: list[str], query: str | None = None) -> str:
+    """Build textual context, optionally using query-weighted spreading."""
+    nodes, edges, _ = self.spread_and_collect_context(seed_ids, max_depth=2, query=query)
+    # ... rest unchanged
+```
+
+**Modify**: `backend/app/agent/nodes.py` — `build_context`
+
+```python
+def build_context(state: AgentState) -> dict[str, Any]:
+    user_id = state["user_id"]
+    activated_ids = state.get("activated_ids", [])
+
+    # Extract user query for contextual spreading
+    query = ""
+    for msg in reversed(state.get("messages", [])):
+        if msg.role == "user":
+            query = msg.content
+            break
+
+    context = ""
+    if activated_ids:
+        mm = _get_memory_manager(user_id)
+        context = mm.get_context_for_prompt(activated_ids, query=query)  # Pass query
+
+    # ... rest unchanged (append document chunks)
+```
+
+**Step 4: Add `get_embedding_cache` factory**
+
+In `embedding_cache.py`, add module-level cache (same pattern as `get_document_store`):
+
+```python
+_caches: dict[str, NodeEmbeddingCache] = {}
+
+def get_embedding_cache(user_id: str) -> NodeEmbeddingCache:
+    if user_id not in _caches:
+        _caches[user_id] = NodeEmbeddingCache(user_id, settings.data_dir)
+    return _caches[user_id]
+```
+
+**Step 5: Update AgentState (optional)**
+
+No change needed — the query is already available via `state["messages"]`. No new state fields required.
+
+#### Data Flow Diagram
+
+```
+User: "How does fairness impact hiring?"
+     │
+     ▼
+extract_concepts → ["fairness", "hiring"]
+     │
+     ▼
+activate_memory → activated_ids = ["fairness", "hiring", "bias", ...]
+     │
+     ▼
+retrieve_documents → chunks from ChromaDB (semantic + graph-guided)
+     │
+     ▼
+build_context:
+  │
+  ├── query = "How does fairness impact hiring?"
+  │
+  ├── NodeEmbeddingCache.ensure_fresh(graph)
+  │     └── if stale: batch embed 500 labels → save .npz
+  │
+  ├── NodeEmbeddingCache.get_similarities(query)
+  │     └── 1 API call (query embedding) + numpy dot products
+  │     └── returns {node_id: similarity} for all 500 nodes
+  │
+  ├── SpreadingActivation.spread(seeds, query_similarities=sims)
+  │     └── context_factor = 0.3 + 0.7 × similarity
+  │     └── "hiring discrimination" gets 0.94 factor (strong)
+  │     └── "EU AI Act" gets 0.51 factor (dampened)
+  │     └── "machine learning" gets 0.48 factor → below threshold → pruned
+  │
+  └── Build text context from filtered subgraph + document chunks
+     │
+     ▼
+generate_response → LLM receives focused, relevant context
+```
+
+#### Performance Analysis
+
+| Operation | Cost | When |
+|---|---|---|
+| Embed all node labels (500) | ~$0.00005, ~1s | Only when cache is stale (nodes added/removed) |
+| Embed user query | ~$0.000001, ~200ms | Every query |
+| Cosine similarity (500 nodes) | ~0.01ms (numpy) | Every query |
+| Cache disk I/O (.npz) | ~5ms | Load on first query, save on rebuild |
+
+**Total overhead per query**: ~200ms (dominated by query embedding API call).
+**Total overhead for cache rebuild**: ~1s + $0.00005 (rare — only after ingestion or dedup).
+
+#### Files to Create/Modify
+
+| File | Action | Description |
+|---|---|---|
+| `backend/app/graph_kb/embedding_cache.py` | **Create** | NodeEmbeddingCache: build, persist, query similarities |
+| `backend/app/graph_kb/spreading.py` | Modify | Add `query_similarities` parameter, compute `context_factor` |
+| `backend/app/graph_kb/memory.py` | Modify | Thread `query` through `spread_and_collect_context` and `get_context_for_prompt` |
+| `backend/app/agent/nodes.py` | Modify | Extract user query in `build_context`, pass to `get_context_for_prompt` |
+
+#### Backward Compatibility
+
+All changes are additive:
+- `spreading.spread()` without `query_similarities` behaves identically to current code
+- `get_context_for_prompt()` without `query` behaves identically to current code
+- Ingestion pipeline is unaffected (doesn't pass query)
+- Cache is lazily built — no startup cost if never used
+
+#### Edge Cases
+
+| Case | Handling |
+|---|---|
+| New node not in cache | `context_factor = 1.0` (uniform, same as current behavior) |
+| Empty query | `query_similarities = None` → uniform spreading |
+| Cache file missing | Rebuilds automatically on first `ensure_fresh()` call |
+| Node label too short (e.g., "AI") | Included in cache; embedding model handles short strings fine |
+| Deduplication merges nodes | Cache version changes → auto-rebuild on next query |
+
 ### File Ingestion
 - **inputs/ folder** with typed subfolders: documents, people, projects, knowledge, code, media, conversations, data
 - **.taxonomy.json** defines extraction hints per folder type

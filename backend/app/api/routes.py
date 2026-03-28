@@ -97,6 +97,38 @@ async def get_graph_stats(user_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@router.post("/graph/{user_id}/summarize-clusters")
+async def summarize_clusters(user_id: str) -> dict[str, Any]:
+    """Generate LLM summaries for each cluster in the graph."""
+    try:
+        from ..graph_kb.cluster_summarizer import generate_cluster_summaries
+
+        mm = _get_memory_manager(user_id)
+        cluster_data = mm.graph.detect_clusters()
+        clusters = generate_cluster_summaries(mm.graph, cluster_data["clusters"], user_id)
+        return {"clusters": clusters}
+    except Exception as exc:
+        logger.error("Cluster summary error for %s: %s", user_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/graph/{user_id}/deduplicate")
+async def deduplicate_graph(user_id: str, threshold: float = 0.85) -> dict[str, Any]:
+    """Merge semantically duplicate nodes using embedding-based cosine similarity."""
+    try:
+        from ..graph_kb.deduplication import NodeDeduplicator
+
+        mm = _get_memory_manager(user_id)
+        dedup = NodeDeduplicator(mm.graph)
+        stats = dedup.deduplicate(threshold)
+        mm.save()
+        reset_memory_manager(user_id)
+        return stats
+    except Exception as exc:
+        logger.error("Deduplication error for %s: %s", user_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @router.delete("/graph/{user_id}")
 async def reset_graph(user_id: str) -> dict[str, str]:
     """Reset a user's knowledge graph (delete all data)."""

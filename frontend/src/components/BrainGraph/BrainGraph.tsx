@@ -89,6 +89,69 @@ function createPillTexture(label: string, color: string, isSTM: boolean): THREE.
   return texture;
 }
 
+function createActivatedPillTexture(label: string, color: string): THREE.CanvasTexture {
+  const key = `${label}|${color}|activated`;
+  const cached = textureCache.get(key);
+  if (cached) return cached;
+
+  const canvas = document.createElement('canvas');
+  const ctx = canvas.getContext('2d')!;
+  const fontSize = 28;
+  ctx.font = `600 ${fontSize}px Inter, -apple-system, system-ui, sans-serif`;
+  const displayLabel = label.length > 18 ? label.slice(0, 16) + '\u2026' : label;
+  const textWidth = ctx.measureText(displayLabel).width;
+  const padX = 24;
+  const padY = 14;
+  const w = textWidth + padX * 2;
+  const h = fontSize + padY * 2;
+
+  canvas.width = (w + 12) * 2;
+  canvas.height = (h + 12) * 2;
+  ctx.scale(2, 2);
+  ctx.translate(6, 6);
+
+  const radius = h / 2;
+
+  // Outer glow
+  ctx.shadowColor = color;
+  ctx.shadowBlur = 12;
+  ctx.fillStyle = color;
+  ctx.globalAlpha = 0.3;
+  ctx.beginPath();
+  ctx.roundRect(0, 0, w, h, radius);
+  ctx.fill();
+  ctx.shadowBlur = 0;
+
+  // Pill background — brighter
+  ctx.fillStyle = color;
+  ctx.globalAlpha = 1.0;
+  ctx.beginPath();
+  ctx.roundRect(2, 2, w - 4, h - 4, radius - 2);
+  ctx.fill();
+
+  // Bright border
+  ctx.globalAlpha = 0.9;
+  ctx.strokeStyle = '#ffffff';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.roundRect(2, 2, w - 4, h - 4, radius - 2);
+  ctx.stroke();
+
+  // Text
+  ctx.globalAlpha = 1;
+  ctx.font = `600 ${fontSize}px Inter, -apple-system, system-ui, sans-serif`;
+  ctx.textAlign = 'center';
+  ctx.textBaseline = 'middle';
+  ctx.fillStyle = '#ffffff';
+  ctx.fillText(displayLabel, w / 2, h / 2 + 1);
+
+  const texture = new THREE.CanvasTexture(canvas);
+  texture.minFilter = THREE.LinearFilter;
+  texture.needsUpdate = true;
+  textureCache.set(key, texture);
+  return texture;
+}
+
 // Deterministic hash for stable initial positions
 function hashId(id: string): number {
   let h = 0;
@@ -218,21 +281,50 @@ export function BrainGraph() {
     }
   }, [nodes.length]);
 
+  // Activation highlight: fly camera to activated nodes, then clear after 8s
+  useEffect(() => {
+    if (activatedNodes.size === 0 || !fgRef.current) return;
+
+    // Fly camera to center of activated nodes
+    const activated = graphData.nodes.filter(n => activatedNodes.has(n.id));
+    if (activated.length > 0) {
+      let cx = 0, cy = 0, cz = 0;
+      for (const n of activated) { cx += (n.x || 0); cy += (n.y || 0); cz += (n.z || 0); }
+      cx /= activated.length; cy /= activated.length; cz /= activated.length;
+      const dist = Math.max(40, activated.length * 2);
+      fgRef.current.cameraPosition(
+        { x: cx + dist * 0.5, y: cy + dist * 0.3, z: cz + dist },
+        { x: cx, y: cy, z: cz },
+        1000
+      );
+    }
+
+    // Clear activation glow after 8 seconds
+    const timer = setTimeout(() => {
+      useGraphStore.setState({ activatedNodes: new Set() });
+    }, 8000);
+    return () => clearTimeout(timer);
+  }, [activatedNodes, graphData.nodes]);
+
   // Node Three.js object — billboard sprite with cached pill texture
   const nodeThreeObject = useCallback((node: GraphNode) => {
     const color = getNodeColor(node.id);
-    const texture = createPillTexture(node.label, color, node.memory_type === 'stm');
+    const isActivated = activatedNodes.has(node.id);
+
+    const texture = isActivated
+      ? createActivatedPillTexture(node.label, color)
+      : createPillTexture(node.label, color, node.memory_type === 'stm');
 
     const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false });
     const sprite = new THREE.Sprite(mat);
 
     const canvas = texture.image as HTMLCanvasElement;
     const aspect = canvas.width / canvas.height;
-    const scale = 2 + node.importance * 1;
+    const scale = isActivated ? (3 + node.importance * 1.5) : (2 + node.importance * 1);
     sprite.scale.set(scale * aspect, scale, 1);
 
     return sprite;
-  }, [getNodeColor]);
+  }, [getNodeColor, activatedNodes]);
 
   // Link styling
   const linkColor = useCallback((link: GraphLink) => {
@@ -432,7 +524,7 @@ export function BrainGraph() {
           {clusters.filter((c) => c.size > 1).sort((a, b) => b.size - a.size).slice(0, 12).map((cluster) => {
             const col = CLUSTER_COLORS[cluster.id % CLUSTER_COLORS.length];
             return (
-              <div key={cluster.id} onClick={() => handleZoomToCluster(cluster.id)} style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 10px', borderRadius: '10px', background: `${col}15`, border: `1px solid ${col}40`, fontSize: '11px', color: col, cursor: 'pointer', transition: 'all 0.15s' }}
+              <div key={cluster.id} onClick={() => handleZoomToCluster(cluster.id)} title={cluster.summary || ''} style={{ display: 'flex', alignItems: 'center', gap: '6px', padding: '3px 10px', borderRadius: '10px', background: `${col}15`, border: `1px solid ${col}40`, fontSize: '11px', color: col, cursor: 'pointer', transition: 'all 0.15s' }}
                 onMouseEnter={(e) => { e.currentTarget.style.background = `${col}30`; }}
                 onMouseLeave={(e) => { e.currentTarget.style.background = `${col}15`; }}>
                 <div style={{ width: 8, height: 8, borderRadius: '50%', background: col, flexShrink: 0 }} />

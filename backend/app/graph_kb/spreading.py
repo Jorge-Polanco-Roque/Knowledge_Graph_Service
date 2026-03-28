@@ -17,8 +17,16 @@ class SpreadingActivation:
         seed_ids: list[str],
         max_depth: int = 2,
         min_activation: float = 0.05,
+        query_similarities: dict[str, float] | None = None,
     ) -> tuple[dict[str, float], list[list[str]]]:
-        """Spread activation from seed nodes.
+        """Spread activation from seed nodes, optionally weighted by query relevance.
+
+        Args:
+            seed_ids: starting nodes for activation
+            max_depth: how many hops to propagate
+            min_activation: threshold below which propagation stops
+            query_similarities: {node_id: cosine_similarity} for contextual weighting.
+                When provided, neighbors more relevant to the query get stronger activation.
 
         Returns:
             activations: mapping of node_id -> activation level after spreading
@@ -51,8 +59,15 @@ class SpreadingActivation:
                     if neighbor_id in visited:
                         continue
 
-                    # Activation = parent_activation * edge_weight * spreading_factor
-                    spread_value = parent_activation * edge.weight * settings.spreading_factor
+                    # Context factor: modulate by query relevance if available
+                    if query_similarities and neighbor_id in query_similarities:
+                        sim = max(0.0, query_similarities[neighbor_id])
+                        context_factor = 0.3 + 0.7 * sim
+                    else:
+                        context_factor = 1.0  # No query info → uniform spreading
+
+                    # Activation = parent × edge_weight × spreading_factor × context_factor
+                    spread_value = parent_activation * edge.weight * settings.spreading_factor * context_factor
 
                     if spread_value < min_activation:
                         continue

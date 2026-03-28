@@ -155,10 +155,22 @@ class MemoryManager:
         return activated_ids, diff
 
     def spread_and_collect_context(
-        self, seed_ids: list[str], max_depth: int = 2
+        self, seed_ids: list[str], max_depth: int = 2, query: str | None = None,
     ) -> tuple[list[NodeData], list[EdgeData], list[list[str]]]:
-        """Spread activation from seeds and return the relevant subgraph + animation waves."""
-        activations, waves = self.spreading.spread(seed_ids, max_depth=max_depth)
+        """Spread activation from seeds, optionally weighted by query relevance."""
+        query_similarities = None
+        if query:
+            try:
+                from .embedding_cache import get_embedding_cache
+                cache = get_embedding_cache(self.user_id)
+                cache.ensure_fresh(self.graph)
+                query_similarities = cache.get_similarities(query)
+            except Exception as e:
+                logger.warning("Embedding cache failed, using uniform spreading: %s", e)
+
+        activations, waves = self.spreading.spread(
+            seed_ids, max_depth=max_depth, query_similarities=query_similarities,
+        )
 
         # Collect all activated node IDs (seeds + spread targets)
         relevant_ids = list(activations.keys())
@@ -166,9 +178,9 @@ class MemoryManager:
 
         return sub.nodes, sub.edges, waves
 
-    def get_context_for_prompt(self, seed_ids: list[str]) -> str:
+    def get_context_for_prompt(self, seed_ids: list[str], query: str | None = None) -> str:
         """Build a textual context from the active subgraph for the LLM prompt."""
-        nodes, edges, _ = self.spread_and_collect_context(seed_ids, max_depth=2)
+        nodes, edges, _ = self.spread_and_collect_context(seed_ids, max_depth=2, query=query)
 
         if not nodes:
             return ""
