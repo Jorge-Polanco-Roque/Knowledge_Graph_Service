@@ -6,8 +6,12 @@ LTM acts like the neocortex: stable, persistent, consolidated from STM.
 
 from __future__ import annotations
 
+import logging
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from ..config import settings
 from ..models.graph import (
@@ -31,10 +35,17 @@ def _now() -> datetime:
 class MemoryManager:
     """Manages dual memory (STM + LTM) for a single user."""
 
+    _locks: dict[str, threading.Lock] = {}
+
     def __init__(self, user_id: str, data_dir: Path | None = None) -> None:
         self.user_id = user_id
         self._data_dir = data_dir or settings.data_dir
         self._graph_path = self._data_dir / "users" / user_id / "graph.json"
+
+        # Per-user lock for thread-safe graph mutations
+        if user_id not in self._locks:
+            self._locks[user_id] = threading.Lock()
+        self._lock = self._locks[user_id]
 
         # Single unified graph — nodes are tagged as STM or LTM
         self.graph = KnowledgeGraph.load(self._graph_path)
@@ -50,6 +61,8 @@ class MemoryManager:
     ) -> tuple[list[str], GraphDiff]:
         """Process extracted concepts: add/activate nodes, apply plasticity, return diff.
 
+        Thread-safe: acquires per-user lock to prevent concurrent graph corruption.
+
         Args:
             concepts: list of dicts with keys: label, category, relationships (optional)
 
@@ -57,108 +70,83 @@ class MemoryManager:
             activated_ids: list of activated node IDs
             diff: graph changes for the frontend
         """
-        snapshot_before = self.graph.snapshot()
+        with self._lock:
+            snapshot_before = self.graph.snapshot()
+            activated_ids: list[str] = []
 
-        activated_ids: list[str] = []
+            for concept in concepts:
+                label = concept["label"]
+                if self._is_sensitive_concept(label):
+                    logger.warning("Blocked sensitive concept: %s", label)
+                    continue
 
-        for concept in concepts:
-            label = concept["label"]
+                category = concept.get("category", "concept")
+                node_id = self._label_to_id(label)
 
-            # Block sensitive concepts from entering the graph
-            if self._is_sensitive_concept(label):
-                logger.warning("Blocked sensitive concept: %s", label)
-                continue
-
-            category = concept.get("category", "concept")
-            node_id = self._label_to_id(label)
-
-            existing = self.graph.get_node(node_id)
-            if existing is None:
-                # Neurogenesis: create new node in STM
-                node = NodeData(
-                    id=node_id,
-                    label=label,
-                    category=category,
-                    activation=1.0,
-                    importance=0.1,
-                    memory_type=MemoryType.STM,
-                    activation_count=1,
-                )
-                self.graph.add_node(node)
-            else:
-                # Re-activate existing node
-                self.graph.update_node(
-                    node_id,
-                    activation=min(1.0, existing.activation + 0.5),
-                    activation_count=existing.activation_count + 1,
-                    last_activated=_now().isoformat(),
-                )
-            activated_ids.append(node_id)
-
-            # Process explicit relationships from extraction
-            for rel in concept.get("relationships", []):
-                target_label = rel["target_label"]
-                target_id = self._label_to_id(target_label)
-                rel_type = rel.get("relationship", "related_to")
-                # Validate relationship type — fallback to related_to if LLM invents one
-                valid_rels = {"related_to", "is_a", "part_of", "causes", "has_property",
-                              "used_for", "located_in", "created_by", "depends_on", "opposite_of"}
-                if rel_type not in valid_rels:
-                    rel_type = "related_to"
-
-                if not self.graph.has_node(target_id):
-                    # Create the target node too
-                    target_node = NodeData(
-                        id=target_id,
-                        label=target_label,
-                        category="concept",
-                        activation=0.5,
-                        memory_type=MemoryType.STM,
-                        activation_count=1,
+                existing = self.graph.get_node(node_id)
+                if existing is None:
+                    node = NodeData(
+                        id=node_id, label=label, category=category,
+                        activation=1.0, importance=0.1,
+                        memory_type=MemoryType.STM, activation_count=1,
                     )
-                    self.graph.add_node(target_node)
-                    activated_ids.append(target_id)
-
-                if not self.graph.get_edge(node_id, target_id):
-                    edge = EdgeData(
-                        source=node_id,
-                        target=target_id,
-                        weight=settings.hebbian_learning_rate,
-                        relationship=rel_type,
-                        co_activation_count=1,
+                    self.graph.add_node(node)
+                else:
+                    self.graph.update_node(
+                        node_id,
+                        activation=min(1.0, existing.activation + 0.5),
+                        activation_count=existing.activation_count + 1,
+                        last_activated=_now().isoformat(),
                     )
-                    self.graph.add_edge(edge)
+                activated_ids.append(node_id)
 
-        # Fuzzy-match extracted concepts against existing graph nodes
-        # so the context includes rich existing knowledge, not just new stubs
-        for concept in concepts:
-            related = self._find_related_nodes(concept["label"], max_results=5)
-            for rid in related:
-                if rid not in activated_ids:
-                    activated_ids.append(rid)
-                    # Boost activation of matched nodes
-                    existing = self.graph.get_node(rid)
-                    if existing:
-                        self.graph.update_node(
-                            rid,
-                            activation=min(1.0, existing.activation + 0.3),
-                            last_activated=_now().isoformat(),
+                for rel in concept.get("relationships", []):
+                    target_label = rel["target_label"]
+                    target_id = self._label_to_id(target_label)
+                    rel_type = rel.get("relationship", "related_to")
+                    valid_rels = {"related_to", "is_a", "part_of", "causes", "has_property",
+                                  "used_for", "located_in", "created_by", "depends_on", "opposite_of"}
+                    if rel_type not in valid_rels:
+                        rel_type = "related_to"
+
+                    if not self.graph.has_node(target_id):
+                        target_node = NodeData(
+                            id=target_id, label=target_label, category="concept",
+                            activation=0.5, memory_type=MemoryType.STM, activation_count=1,
                         )
+                        self.graph.add_node(target_node)
+                        activated_ids.append(target_id)
 
-        # Apply plasticity
-        self.plasticity.apply_plasticity(activated_ids)
+                    if not self.graph.get_edge(node_id, target_id):
+                        edge = EdgeData(
+                            source=node_id, target=target_id,
+                            weight=settings.hebbian_learning_rate,
+                            relationship=rel_type, co_activation_count=1,
+                        )
+                        self.graph.add_edge(edge)
 
-        # Enforce STM capacity — evict lowest-activation STM nodes
-        self._enforce_stm_capacity()
+            # Fuzzy-match extracted concepts against existing graph nodes
+            for concept in concepts:
+                related = self._find_related_nodes(concept["label"], max_results=5)
+                for rid in related:
+                    if rid not in activated_ids:
+                        activated_ids.append(rid)
+                        existing = self.graph.get_node(rid)
+                        if existing:
+                            self.graph.update_node(
+                                rid, activation=min(1.0, existing.activation + 0.3),
+                                last_activated=_now().isoformat(),
+                            )
 
-        # Consolidate STM → LTM
-        self._consolidate()
+            self.plasticity.apply_plasticity(activated_ids)
+            self._enforce_stm_capacity()
+            self._consolidate()
 
-        snapshot_after = self.graph.snapshot()
-        diff = self.graph.compute_diff(snapshot_before, snapshot_after)
-        diff.activated_nodes = activated_ids
+            snapshot_after = self.graph.snapshot()
+            diff = self.graph.compute_diff(snapshot_before, snapshot_after)
+            diff.activated_nodes = activated_ids
 
-        return activated_ids, diff
+            return activated_ids, diff
 
     def spread_and_collect_context(
         self, seed_ids: list[str], max_depth: int = 2, query: str | None = None,

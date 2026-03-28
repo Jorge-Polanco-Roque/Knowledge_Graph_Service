@@ -70,9 +70,18 @@ class KnowledgeGraph:
     # ------------------------------------------------------------------
 
     def add_edge(self, edge: EdgeData) -> None:
+        if edge.source == edge.target:
+            return  # Prevent self-loops
         self._graph.add_edge(
             edge.source, edge.target, **edge.model_dump(mode="json")
         )
+
+    def remove_self_loops(self) -> int:
+        """Remove all self-loop edges. Returns count removed."""
+        loops = [(u, v) for u, v in self._graph.edges() if u == v]
+        for u, v in loops:
+            self._graph.remove_edge(u, v)
+        return len(loops)
 
     def get_edge(self, source: str, target: str) -> EdgeData | None:
         data = self._graph.edges.get((source, target))
