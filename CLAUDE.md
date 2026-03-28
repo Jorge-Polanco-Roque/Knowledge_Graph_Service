@@ -77,6 +77,10 @@ backend/ (Python + FastAPI)
 - **Prompt injection defense**: Immutable identity block at top of system prompt prevents persona override attacks. Input sanitization detects common injection patterns and logs warnings.
 - **Concept sanitization**: Blocklist filters sensitive terms (password, credential, secret_key, etc.) from being created as graph nodes.
 - **User ID validation**: Regex `[a-zA-Z0-9_-]{1,64}` on all endpoints and WebSocket to prevent path traversal.
+- **Context mode** (`config.py → context_mode`): Controls LLM context assembly.
+  - `"chunks_only"` **(default, Mode D)**: Only RAG document chunks (top 7). More accurate, no graph label noise. A/B/C/D testing showed this mode wins on factual precision (EquiHire correctly identified as "startup" not "acqui-hire"), same latency, 30% less tokens.
+  - `"graph_and_chunks"` **(Mode A)**: Graph context (spreading activation, 20 concepts + 30 relationships) + RAG chunks. Richer connections but may infer wrong meanings from node labels. Reactivate by setting `CONTEXT_MODE=graph_and_chunks` in `.env`.
+  - The graph is still used in both modes for: 3D visualization, spreading activation, fuzzy matching, graph-guided RAG retrieval, deduplication, clustering. Only the LLM prompt context changes.
 
 ### Performance Optimizations (validated through stress testing)
 
@@ -726,6 +730,65 @@ The user starts reading at 1.5s instead of waiting until 6.0s. Perceived latency
 | Total response time | 5-10s | 5-10s (same) |
 | Perceived latency | High (blank screen) | Low (streaming text) |
 | WebSocket messages per response | 3 | 30-100+ (1 per token) |
+
+### A/B Test: Graph+Chunks vs Chunks-Only
+
+#### Hypothesis
+
+The graph context (node labels + relationships) may be HURTING answer accuracy because:
+1. **Node labels lack definitions** — "EquiHire" as a node name leads the LLM to infer "acqui-hire" (wrong) instead of reading the document that says "recruitment startup"
+2. **Relationships are generic** — `related_to`, `is_a`, `part_of` without context. The LLM fills in meaning that may be wrong
+3. **Graph competes with documents** — When both say different things, the LLM mixes them, creating confused responses (paragraph 1 = graph inference, paragraph 2 = document truth)
+4. **Token waste** — Graph context (~1.2K tokens) takes space that could hold more document chunks
+
+The document chunks ARE the source text — full context, definitions, examples, nuance.
+
+#### Test Design
+
+**Mode A (current)**: `graph_context + document_chunks → LLM`
+**Mode B (chunks-only)**: `document_chunks only → LLM` (graph context stripped)
+
+Same 8 questions, same user, same model, compared side-by-side.
+
+#### Test Questions (with expected answers from actual documents)
+
+| # | Question | Expected Answer (from docs) | Tests |
+|---|---|---|---|
+| Q1 | "Qué es EquiHire?" | Recruitment startup in the EU | Factual definition |
+| Q2 | "Qué herramientas ha implementado EquiHire?" | Fair AI Scrum Toolkit, Organizational Integration Toolkit, Advanced Architecture Cookbook | Specific detail recall |
+| Q3 | "Qué es el Fairness Audit Playbook?" | Should cite specific playbook content | Document-grounded explanation |
+| Q4 | "Cómo clasifica el EU AI Act los sistemas de alto riesgo?" | Risk categories from the act | Regulatory knowledge |
+| Q5 | "Qué es demographic parity?" | Fairness metric: equal selection rates across groups | Concept definition |
+| Q6 | "Qué desafíos enfrentó EquiHire con su cliente internacional?" | Regulatory compliance across EU countries, bias risk assessments | Narrative detail |
+| Q7 | "Qué es la regla del 80% en fairness de contratación?" | Four-fifths rule: selection rate ≥80% of highest group | Specific factual claim |
+| Q8 | "Cómo se relaciona fairness con feedback loops?" | Biased decisions → biased data → amplified bias cycle | Conceptual relationship |
+
+#### Scoring per question (0-3)
+
+- **Accuracy** (0-3): 0=wrong, 1=partially correct, 2=mostly correct, 3=fully correct per documents
+- **Groundedness** (0-2): 0=hallucinated details, 1=general knowledge only, 2=cites documents
+- **Confusion** (0-2): 0=clear and coherent, 1=mixes sources, 2=contradictory
+
+#### Implementation
+
+Create a test script that:
+1. Calls `build_context` normally (Mode A) and captures the context
+2. Calls `build_context` with `activated_ids=[]` to force chunks-only (Mode B)
+3. Sends both contexts to `generate_response` with the same query
+4. Compares responses side-by-side
+
+No code changes to production — this is a test-only script that calls the pipeline functions directly.
+
+#### Expected Outcome Scenarios
+
+**If Mode B (chunks-only) wins on accuracy:**
+→ Graph context is noise. Consider: making graph context opt-in, or only including graph context for queries where documents are insufficient.
+
+**If Mode A (graph+chunks) wins on synthesis:**
+→ Graph adds value for connecting concepts across documents, but hurts factual precision. Consider: separate graph context into "connections" section, clearly labeled as "inferred relationships" vs "document evidence."
+
+**If they're equal:**
+→ Graph context is redundant. The 1.2K tokens could be saved or used for more document chunks.
 
 ### Cross-Linking: Graph ↔ Documents
 
