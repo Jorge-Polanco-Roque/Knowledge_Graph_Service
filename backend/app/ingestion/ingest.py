@@ -279,8 +279,11 @@ def ingest_file(
                     relative_folder = str(file_path.parent.relative_to(inputs_dir))
                 except ValueError:
                     relative_folder = folder_name
+                # Use folder/filename as source_file to avoid collisions
+                # (multiple files named article_1.docx in different folders)
+                source_id = f"{relative_folder}/{file_data['filename']}" if relative_folder != folder_name else file_data["filename"]
                 chunk_metadata = {
-                    "source_file": file_data["filename"],
+                    "source_file": source_id,
                     "folder": relative_folder,
                     "folder_type": folder_ctx.get("default_category", "general") if folder_ctx else "general",
                 }
