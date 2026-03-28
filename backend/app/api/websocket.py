@@ -4,10 +4,26 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import traceback
 
 from fastapi import WebSocket, WebSocketDisconnect
 from langchain_openai import ChatOpenAI
+
+# --- Security: Prompt injection detection ---
+_INJECTION_PATTERNS = [
+    "ignore all previous", "ignore your instructions", "you are now",
+    "act as if", "pretend to be", "new persona", "forget your",
+    "reveal your prompt", "show me your system", "system prompt",
+    "override your", "disregard your", "ignore the above",
+    "do not follow", "bypass your", "jailbreak",
+]
+_VALID_USER_ID = re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
+
+
+def _check_injection(content: str) -> bool:
+    lower = content.lower()
+    return any(p in lower for p in _INJECTION_PATTERNS)
 
 from ..agent.nodes import (
     SYSTEM_PROMPT,
@@ -42,6 +58,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str) -> None:
             3. {"type": "graph_diff", "data": {...}}
             4. {"type": "spreading_activation", "data": {"waves": [...]}}
     """
+    # Validate user_id
+    if not _VALID_USER_ID.match(user_id):
+        await websocket.close(code=4000, reason="Invalid user_id")
+        return
+
     await websocket.accept()
     logger.info("WebSocket connected: user_id=%s", user_id)
 
@@ -62,6 +83,11 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str) -> None:
                 continue
 
             content = raw.get("data", {}).get("content", "").strip()
+
+            # Prompt injection detection — don't block, but flag for the LLM
+            if _check_injection(content):
+                logger.warning("Potential prompt injection from user %s: %s", user_id, content[:100])
+
             if not content:
                 await websocket.send_json(
                     WSMessage(

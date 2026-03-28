@@ -3,10 +3,23 @@
 from __future__ import annotations
 
 import logging
+import re
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
+
+_VALID_USER_ID = re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
+
+
+def _validate_user_id(user_id: str) -> str:
+    """Validate user_id to prevent path traversal and other attacks."""
+    if not _VALID_USER_ID.match(user_id):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid user_id. Only alphanumeric, hyphens, and underscores allowed (max 64 chars).",
+        )
+    return user_id
 
 from ..agent.graph_agent import create_agent
 from ..agent.nodes import _get_memory_manager, reset_memory_manager
@@ -29,6 +42,7 @@ _agent = create_agent()
 class ChatRequest(BaseModel):
     user_id: str
     message: str
+    history: list[dict[str, str]] = []  # Optional: [{"role": "user", "content": "..."}, ...]
 
 
 class ChatResponse(BaseModel):
@@ -44,13 +58,22 @@ class ChatResponse(BaseModel):
 @router.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest) -> ChatResponse:
     """Send a message and receive an agent response with graph updates."""
+    _validate_user_id(req.user_id)
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-    user_msg = ChatMessage(role=MessageRole.USER, content=req.message.strip())
+    # Build message history (optional) + current message
+    messages: list[ChatMessage] = []
+    for h in req.history:
+        try:
+            role = MessageRole(h.get("role", "user"))
+            messages.append(ChatMessage(role=role, content=h.get("content", "")))
+        except ValueError:
+            pass  # Skip invalid roles
+    messages.append(ChatMessage(role=MessageRole.USER, content=req.message.strip()))
 
     initial_state = {
-        "messages": [user_msg],
+        "messages": messages,
         "user_id": req.user_id,
     }
 
@@ -73,6 +96,7 @@ async def chat(req: ChatRequest) -> ChatResponse:
 @router.get("/graph/{user_id}")
 async def get_graph(user_id: str) -> dict[str, Any]:
     """Return the full graph snapshot for a user, including cluster info."""
+    _validate_user_id(user_id)
     try:
         mm = _get_memory_manager(user_id)
         snapshot = mm.get_full_snapshot()
@@ -89,6 +113,7 @@ async def get_graph(user_id: str) -> dict[str, Any]:
 @router.get("/graph/{user_id}/stats")
 async def get_graph_stats(user_id: str) -> dict[str, Any]:
     """Return statistics about a user's knowledge graph."""
+    _validate_user_id(user_id)
     try:
         mm = _get_memory_manager(user_id)
         return mm.get_stats()
@@ -146,6 +171,7 @@ async def deduplicate_graph(user_id: str, threshold: float = 0.85) -> dict[str, 
 @router.delete("/graph/{user_id}")
 async def reset_graph(user_id: str) -> dict[str, str]:
     """Full reset: clear knowledge graph, ChromaDB chunks, and embedding cache."""
+    _validate_user_id(user_id)
     try:
         from ..graph_kb.knowledge_graph import KnowledgeGraph
 
@@ -238,6 +264,7 @@ async def list_input_files() -> dict[str, Any]:
 @router.post("/ingest/{user_id}")
 async def ingest_all(user_id: str) -> dict[str, Any]:
     """Ingest all files from the inputs/ directory into the user's knowledge graph."""
+    _validate_user_id(user_id)
     inputs_dir = settings.data_dir.parent / "inputs"
     inputs_dir.mkdir(parents=True, exist_ok=True)
 

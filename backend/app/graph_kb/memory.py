@@ -63,6 +63,12 @@ class MemoryManager:
 
         for concept in concepts:
             label = concept["label"]
+
+            # Block sensitive concepts from entering the graph
+            if self._is_sensitive_concept(label):
+                logger.warning("Blocked sensitive concept: %s", label)
+                continue
+
             category = concept.get("category", "concept")
             node_id = self._label_to_id(label)
 
@@ -247,6 +253,17 @@ class MemoryManager:
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
+
+    _SENSITIVE_PATTERNS = [
+        "password", "secret", "credential", "api_key", "api key",
+        "private_key", "private key", "ssn", "social_security",
+        "credit_card", "credit card", "bank_account", "bank account",
+    ]
+
+    def _is_sensitive_concept(self, label: str) -> bool:
+        """Check if a concept label contains sensitive information."""
+        lower = label.lower()
+        return any(p in lower for p in self._SENSITIVE_PATTERNS)
 
     def _label_to_id(self, label: str) -> str:
         """Deterministic ID from label."""
