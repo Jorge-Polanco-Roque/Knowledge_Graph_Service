@@ -48,6 +48,7 @@ The application features a split-view interface: a **3D interactive brain visual
 - **File Ingestion** — Ingest documents (.docx, .pdf, .xlsx, .pptx, .csv, .json, .txt, .md), code files, and images (via GPT-4o vision) to bootstrap your knowledge graph
 - **Real-Time Updates** — WebSocket-driven graph diffs push changes instantly to the frontend
 - **Light & Dark Themes** — Full theme support with neural-inspired color palettes
+- **Performance Optimizations** — Context capped at 20 concepts + 30 relationships (~1.2K tokens vs ~18K uncapped), hub edge limiting (max 30 per node), smart embedding cache (LTM-only versioning), ghost node cleanup
 - **Per-User Graphs** — Each user gets an isolated, persistent knowledge graph
 
 ## Architecture

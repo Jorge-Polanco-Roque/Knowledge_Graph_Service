@@ -73,15 +73,21 @@ class NodeEmbeddingCache:
         return hashlib.md5(",".join(sorted(node_ids)).encode()).hexdigest()
 
     def ensure_fresh(self, graph: KnowledgeGraph) -> None:
-        """Rebuild cache if stale (nodes added/removed since last build)."""
+        """Rebuild cache if stale (LTM nodes changed since last build).
+
+        Only LTM nodes count for version — STM changes (every query) don't
+        invalidate the cache. This prevents expensive rebuilds on every query.
+        """
         all_nodes = graph.all_nodes()
-        current_ids = [n.id for n in all_nodes if not n.metadata.get("is_folder")]
-        current_version = self._compute_version(current_ids)
+        # Version based on LTM nodes only — STM is ephemeral
+        ltm_ids = [n.id for n in all_nodes
+                    if n.memory_type.value == "ltm" and not n.metadata.get("is_folder")]
+        current_version = self._compute_version(ltm_ids)
 
         if current_version == self._version and self._embeddings is not None:
             return  # Cache is fresh
 
-        # Rebuild: batch embed all node labels
+        # Rebuild with ALL non-folder nodes (including STM for query matching)
         labels: list[str] = []
         ids: list[str] = []
         for n in all_nodes:

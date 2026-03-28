@@ -51,7 +51,11 @@ class SpreadingActivation:
             next_layer: set[str] = set()
             for node_id in current_layer:
                 parent_activation = activations.get(node_id, 0.0)
-                for edge in self.graph.edges_of_node(node_id):
+                edges = self.graph.edges_of_node(node_id)
+                # Limit hub nodes: only traverse top edges by weight
+                if len(edges) > settings.max_edges_per_node:
+                    edges = sorted(edges, key=lambda e: e.weight, reverse=True)[:settings.max_edges_per_node]
+                for edge in edges:
                     # Determine the neighbor
                     neighbor_id = (
                         edge.target if edge.source == node_id else edge.source

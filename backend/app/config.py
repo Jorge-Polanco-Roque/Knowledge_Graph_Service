@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     consolidation_threshold: float = 0.7
     spreading_factor: float = 0.5
 
+    # Performance limits
+    max_context_concepts: int = 20
+    max_context_relationships: int = 30
+    max_edges_per_node: int = 30
+
     # RAG / Document Store
     rag_chunk_size: int = 600
     rag_chunk_overlap: int = 100

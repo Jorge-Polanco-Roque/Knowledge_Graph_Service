@@ -73,6 +73,141 @@ backend/ (Python + FastAPI)
 - **Cluster summaries**: LLM-generated 2-3 sentence descriptions per cluster. Uses top 10 nodes + relationships + sample document chunks. Endpoint: `POST /api/graph/{user_id}/summarize-clusters`. Summary shown in cluster legend tooltip.
 - **Response visualization**: Activated nodes glow with `createActivatedPillTexture` (brighter fill, white border, outer glow). Camera flies to activation region. Auto-clears after 8 seconds. Uses existing `activatedNodes` from WebSocket `GraphDiff`.
 
+### Performance Optimizations (validated through stress testing)
+
+#### Stress Test Results (504 nodes, 1326 edges)
+
+| Metric | Before | Problem |
+|---|---|---|
+| Simple query | 2.1s | Acceptable |
+| Complex query | 11.3s | Too slow — caused by 18K token context |
+| Context size | 73,923 chars (~18,480 tokens) | 101 concepts + 651 relationships sent to LLM |
+| API calls/query | 6 | Cache rebuilds on every query (STM changes invalidate version) |
+| Hub node | "Individual Fairness" = 324 edges | Spreading activation traverses near-full graph |
+| Ghost nodes | 150 nodes (30%) with 0 edges | Waste embedding cache + clutter visualization |
+
+#### Fix A: Context Size Cap
+
+**Problem**: `get_context_for_prompt()` returns ALL nodes/edges from the spreading subgraph. With hub nodes, one query generates 101 concepts + 651 relationships = ~18K tokens of context. GPT-4o takes 10+ seconds to process.
+
+**Solution**: After collecting the subgraph, cap to top N by activation score.
+
+**Modify**: `backend/app/graph_kb/memory.py` → `get_context_for_prompt()`
+
+```python
+MAX_CONTEXT_CONCEPTS = 20
+MAX_CONTEXT_RELATIONSHIPS = 30
+
+def get_context_for_prompt(self, seed_ids, query=None):
+    nodes, edges, _ = self.spread_and_collect_context(seed_ids, query=query)
+
+    # Cap: top concepts by activation, top relationships by weight
+    nodes = sorted(nodes, key=lambda n: n.activation, reverse=True)[:MAX_CONTEXT_CONCEPTS]
+    node_ids = {n.id for n in nodes}
+    edges = [e for e in edges if e.source in node_ids and e.target in node_ids]
+    edges = sorted(edges, key=lambda e: e.weight, reverse=True)[:MAX_CONTEXT_RELATIONSHIPS]
+
+    # ... build text context from capped lists
+```
+
+**Expected impact**: Context drops from ~18K to ~2K tokens. Response time: 11s → ~4s.
+
+#### Fix B: Smart Cache Invalidation
+
+**Problem**: Every query adds concepts to STM, which changes the node set, which invalidates the `NodeEmbeddingCache` version hash. The cache rebuilds on nearly every query (~1-2s of embedding API calls per rebuild).
+
+**Solution**: Only include LTM nodes in the version hash. STM nodes are ephemeral (capacity=7, rapid decay) and don't meaningfully change the embedding landscape. Cache only rebuilds after ingestion, deduplication, or consolidation (events that change LTM).
+
+**Modify**: `backend/app/graph_kb/embedding_cache.py` → `ensure_fresh()`
+
+```python
+def ensure_fresh(self, graph):
+    all_nodes = graph.all_nodes()
+    # Only LTM nodes count for version — STM changes don't invalidate cache
+    ltm_ids = [n.id for n in all_nodes if n.memory_type.value == "ltm" and not n.metadata.get("is_folder")]
+    current_version = self._compute_version(ltm_ids)
+    if current_version == self._version:
+        return  # Cache is fresh
+    # ... rebuild with ALL non-folder nodes (not just LTM)
+```
+
+**Expected impact**: Eliminates 1-2 embedding API calls per query. Saves ~1s per query.
+
+#### Fix C: Hub Edge Limiting During Spreading
+
+**Problem**: "Individual Fairness" has 324 edges. When spreading activation reaches it, ALL 324 neighbors activate, creating a context explosion.
+
+**Solution**: During spreading traversal, limit each node to its top N edges by weight. Hub nodes only propagate through their strongest connections.
+
+**Modify**: `backend/app/graph_kb/spreading.py` → inside `spread()`
+
+```python
+MAX_EDGES_PER_NODE = 30
+
+for node_id in current_layer:
+    parent_activation = activations.get(node_id, 0.0)
+    edges = self.graph.edges_of_node(node_id)
+    # Limit hub nodes: only traverse top edges by weight
+    if len(edges) > MAX_EDGES_PER_NODE:
+        edges = sorted(edges, key=lambda e: e.weight, reverse=True)[:MAX_EDGES_PER_NODE]
+    for edge in edges:
+        # ... spread as before
+```
+
+**Why not prune the graph?** Hub nodes legitimately have many connections. We just don't want to traverse all of them during context building. The data stays intact for other operations (visualization, analytics).
+
+**Expected impact**: Subgraph shrinks from ~100 nodes to ~30-40 nodes per query. Combined with Fix A, context stays under 2K tokens.
+
+#### Fix D: Ghost Node Cleanup
+
+**Problem**: 150 nodes (30%) have 0 edges. They are concepts extracted during ingestion that never got connected to anything meaningful. They waste embedding cache space, clutter the 3D visualization, and inflate cluster detection.
+
+**Solution**: New cleanup method that removes LTM nodes with 0 edges and low importance. Don't remove STM nodes (freshly created, may get connected soon).
+
+**Create**: New method in `backend/app/graph_kb/knowledge_graph.py`
+
+```python
+def prune_ghost_nodes(self, min_importance: float = 0.3) -> int:
+    """Remove LTM nodes with 0 edges and importance below threshold.
+    Returns number of nodes removed."""
+    to_remove = []
+    for node in self.all_nodes():
+        if (node.memory_type.value == "ltm"
+            and not node.metadata.get("is_folder")
+            and len(self.edges_of_node(node.id)) == 0
+            and node.importance < min_importance):
+            to_remove.append(node.id)
+    for nid in to_remove:
+        self.remove_node(nid)
+    return len(to_remove)
+```
+
+**Add endpoint**: `POST /api/graph/{user_id}/prune-ghosts`
+
+**Expected impact**: Removes ~100-150 nodes. Embedding cache shrinks 30%. 3D visualization is cleaner. Cluster detection is more accurate.
+
+#### Combined Expected Impact
+
+| Metric | Before | After |
+|---|---|---|
+| Context tokens | ~18,480 | ~2,000 |
+| API calls/query | 6 | 3-4 |
+| Complex query latency | 11.3s | ~3-4s |
+| Graph nodes | 504 | ~350 (after ghost pruning) |
+| Cache rebuilds | Every query | Only after ingestion/dedup |
+| Hub traversal | 324 edges | Max 30 edges |
+
+#### Files to Modify
+
+| File | Fix | Change |
+|---|---|---|
+| `backend/app/graph_kb/memory.py` | A | Cap context to 20 concepts + 30 relationships |
+| `backend/app/graph_kb/embedding_cache.py` | B | Version hash from LTM nodes only |
+| `backend/app/graph_kb/spreading.py` | C | Limit edges per node to 30 during traversal |
+| `backend/app/graph_kb/knowledge_graph.py` | D | Add `prune_ghost_nodes()` method |
+| `backend/app/api/routes.py` | D | Add `POST /api/graph/{user_id}/prune-ghosts` endpoint |
+| `backend/app/config.py` | A,C | Add `max_context_concepts`, `max_context_relationships`, `max_edges_per_node` settings |
+
 ### Cross-Linking: Graph ↔ Documents
 
 #### Problem

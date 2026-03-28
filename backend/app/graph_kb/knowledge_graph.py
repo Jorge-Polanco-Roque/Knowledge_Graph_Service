@@ -221,6 +221,22 @@ class KnowledgeGraph:
                 return NodeData.model_validate(data)
         return None
 
+    def prune_ghost_nodes(self, min_importance: float = 0.3) -> int:
+        """Remove LTM nodes with 0 edges and importance below threshold.
+
+        Returns number of nodes removed.
+        """
+        to_remove = []
+        for node in self.all_nodes():
+            if (node.memory_type.value == "ltm"
+                and not node.metadata.get("is_folder")
+                and len(self.edges_of_node(node.id)) == 0
+                and node.importance < min_importance):
+                to_remove.append(node.id)
+        for nid in to_remove:
+            self.remove_node(nid)
+        return len(to_remove)
+
     @property
     def node_count(self) -> int:
         return self._graph.number_of_nodes()

@@ -112,6 +112,20 @@ async def summarize_clusters(user_id: str) -> dict[str, Any]:
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@router.post("/graph/{user_id}/prune-ghosts")
+async def prune_ghost_nodes(user_id: str, min_importance: float = 0.3) -> dict[str, Any]:
+    """Remove LTM nodes with 0 edges and low importance."""
+    try:
+        mm = _get_memory_manager(user_id)
+        removed = mm.graph.prune_ghost_nodes(min_importance)
+        mm.save()
+        reset_memory_manager(user_id)
+        return {"nodes_removed": removed, "remaining_nodes": mm.graph.node_count}
+    except Exception as exc:
+        logger.error("Ghost pruning error for %s: %s", user_id, exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 @router.post("/graph/{user_id}/deduplicate")
 async def deduplicate_graph(user_id: str, threshold: float = 0.85) -> dict[str, Any]:
     """Merge semantically duplicate nodes using embedding-based cosine similarity."""

@@ -179,27 +179,36 @@ class MemoryManager:
         return sub.nodes, sub.edges, waves
 
     def get_context_for_prompt(self, seed_ids: list[str], query: str | None = None) -> str:
-        """Build a textual context from the active subgraph for the LLM prompt."""
+        """Build a textual context from the active subgraph for the LLM prompt.
+
+        Caps context to max_context_concepts and max_context_relationships
+        to keep token usage bounded and response times fast.
+        """
         nodes, edges, _ = self.spread_and_collect_context(seed_ids, max_depth=2, query=query)
 
         if not nodes:
             return ""
 
+        # Cap: top concepts by activation score
+        nodes = sorted(nodes, key=lambda n: n.activation, reverse=True)[:settings.max_context_concepts]
+        node_ids = {n.id for n in nodes}
+
+        # Only include edges where both endpoints are in the capped node set
+        edges = [e for e in edges if e.source in node_ids and e.target in node_ids]
+        edges = sorted(edges, key=lambda e: e.weight, reverse=True)[:settings.max_context_relationships]
+
         lines = ["## Relevant Knowledge Graph Context\n"]
         lines.append("### Concepts:")
-        for n in sorted(nodes, key=lambda x: x.activation, reverse=True):
+        for n in nodes:
             mem = "STM" if n.memory_type == MemoryType.STM else "LTM"
             lines.append(
                 f"- **{n.label}** (category: {n.category}, "
                 f"importance: {n.importance:.2f}, memory: {mem})"
             )
-            if n.metadata:
-                for k, v in n.metadata.items():
-                    lines.append(f"  - {k}: {v}")
 
         if edges:
             lines.append("\n### Relationships:")
-            for e in sorted(edges, key=lambda x: x.weight, reverse=True):
+            for e in edges:
                 src = self.graph.get_node(e.source)
                 tgt = self.graph.get_node(e.target)
                 src_label = src.label if src else e.source
