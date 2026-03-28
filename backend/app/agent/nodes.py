@@ -231,26 +231,37 @@ def build_context(state: AgentState) -> dict[str, Any]:
             query = msg.content
             break
 
-    # Graph context from contextual spreading activation
+    # Build context based on configured mode
     context = ""
-    if activated_ids:
-        mm = _get_memory_manager(user_id)
-        context = mm.get_context_for_prompt(activated_ids, query=query or None)
-
-    # Append RAG document excerpts
     chunks = state.get("document_chunks", [])
-    if chunks:
-        doc_lines = ["\n\n## Relevant Document Excerpts\n"]
-        for chunk in chunks:
-            source = chunk["metadata"].get("source_file", "unknown")
-            folder = chunk["metadata"].get("folder", "")
-            doc_lines.append(f"### [{source}] (from {folder})")
-            doc_lines.append(chunk["content"])
-            doc_lines.append("")
-        context += "\n".join(doc_lines)
 
-    # Out-of-domain detection: check if activated nodes include pre-existing LTM knowledge
-    # STM nodes are ephemeral stubs; only LTM nodes represent established knowledge
+    if settings.context_mode == "graph_and_chunks":
+        # MODE A: Graph context + RAG chunks (richer but may infer from labels)
+        if activated_ids:
+            mm = _get_memory_manager(user_id)
+            context = mm.get_context_for_prompt(activated_ids, query=query or None)
+        if chunks:
+            doc_lines = ["\n\n## Relevant Document Excerpts\n"]
+            for chunk in chunks:
+                source = chunk["metadata"].get("source_file", "unknown")
+                folder = chunk["metadata"].get("folder", "")
+                doc_lines.append(f"### [{source}] (from {folder})")
+                doc_lines.append(chunk["content"])
+                doc_lines.append("")
+            context += "\n".join(doc_lines)
+    else:
+        # MODE D (default): Chunks only (more accurate, no graph label noise)
+        if chunks:
+            doc_lines = ["## Relevant Document Excerpts\n"]
+            for chunk in chunks:
+                source = chunk["metadata"].get("source_file", "unknown")
+                folder = chunk["metadata"].get("folder", "")
+                doc_lines.append(f"### [{source}] (from {folder})")
+                doc_lines.append(chunk["content"])
+                doc_lines.append("")
+            context = "\n".join(doc_lines)
+
+    # Out-of-domain detection
     has_established_knowledge = False
     if activated_ids:
         mm = _get_memory_manager(user_id)

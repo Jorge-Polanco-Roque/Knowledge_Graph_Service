@@ -31,6 +31,11 @@ class Settings(BaseSettings):
     consolidation_threshold: float = 0.7
     spreading_factor: float = 0.5
 
+    # Context mode: "chunks_only" (Mode D) or "graph_and_chunks" (Mode A)
+    # chunks_only: only RAG document chunks, no graph context (more accurate, less noise)
+    # graph_and_chunks: graph context + RAG chunks (richer connections, but may infer from labels)
+    context_mode: str = "chunks_only"
+
     # Performance limits
     max_context_concepts: int = 20
     max_context_relationships: int = 30
@@ -39,7 +44,7 @@ class Settings(BaseSettings):
     # RAG / Document Store
     rag_chunk_size: int = 600
     rag_chunk_overlap: int = 100
-    rag_top_k: int = 5
+    rag_top_k: int = 7
     rag_embedding_model: str = "text-embedding-3-small"
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "env_file_override": True}
