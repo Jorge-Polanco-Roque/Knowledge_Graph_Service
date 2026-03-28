@@ -265,8 +265,11 @@ def ingest_file(
     # Read the file
     file_data = read_file(file_path)
 
-    # RAG: Store document chunks (text files only, skip images)
-    if file_data["type"] != "image" and file_data.get("content"):
+    # RAG: Store document chunks (text files only, skip images and conversations)
+    # Conversations are auto-saved agent responses that may contain hallucinations —
+    # ingesting them as RAG sources creates a self-hallucination feedback loop.
+    is_conversation = folder_name == "conversations" or file_data["filename"].startswith("chat_")
+    if file_data["type"] != "image" and file_data.get("content") and not is_conversation:
         content = file_data["content"]
         if not content.startswith("[Error") and not content.startswith("[Empty"):
             try:
