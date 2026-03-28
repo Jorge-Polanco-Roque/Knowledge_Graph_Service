@@ -82,9 +82,24 @@ backend/ (Python + FastAPI)
   - `"graph_and_chunks"` **(Mode A)**: Graph context (spreading activation, 20 concepts + 30 relationships) + RAG chunks. Richer connections but may infer wrong meanings from node labels. Reactivate by setting `CONTEXT_MODE=graph_and_chunks` in `.env`.
   - The graph is still used in both modes for: 3D visualization, spreading activation, fuzzy matching, graph-guided RAG retrieval, deduplication, clustering. Only the LLM prompt context changes.
 
+### Clean Re-ingestion Results
+
+After R1 clean re-ingestion with all fixes active (relationship validation, dedup, ghost pruning, source_file collision fix, document summaries):
+
+| Metric | Before (dirty) | After (clean) | Why |
+|---|---|---|---|
+| Nodes | 499 | **304** | Dedup merged 31, pruning removed 87 |
+| Edges | ~1,300 | **2,607** | Relationship validation: fallback instead of crash = more valid edges |
+| Clusters | variable | **14** (with LLM summaries) | Cleaner graph = better community detection |
+| Cross-linking | 0/499 | **302/304** with source_files | All nodes know their source documents |
+| ChromaDB chunks | 512 (contaminated) | **4,844** (60 summaries + 4,784 fragments) | Source collision fix: folder/filename as key |
+| Document summaries | 0 | **60** (1 per document) | Auto-generated during ingestion (R2) |
+
+Key fix discovered during re-ingestion: files with identical names in different folders (e.g., `article_1.docx` in Module_1/Sprint_1 and Module_1/Sprint_2) were overwriting each other's chunks in ChromaDB. Fixed by using `folder/filename` as the `source_file` key instead of just `filename`.
+
 ### Performance Optimizations (validated through stress testing)
 
-#### Stress Test Results (504 nodes, 1326 edges)
+#### Stress Test Results (pre-optimization, 504 nodes, 1326 edges)
 
 | Metric | Before | Problem |
 |---|---|---|
