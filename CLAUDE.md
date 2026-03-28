@@ -70,6 +70,116 @@ backend/ (Python + FastAPI)
 - **Relationship validation**: LLM-extracted relationship types are validated against the `RelationshipType` enum; invalid values fallback to `related_to` to prevent Pydantic crashes.
 - **Spreading activation**: Depth=2, min_activation=0.05, factor=0.5. Context built from activated subgraph includes concepts + relationships for the LLM prompt.
 
+### Cross-Linking: Graph ↔ Documents
+
+#### Problem
+
+Graph nodes and ChromaDB chunks are two independent systems that both originate from the same documents, but have no link between them. When the user asks about "Fairness", the agent does semantic search AND graph activation independently — but doesn't know that the node "Fairness" was extracted from `article_3.docx`, which also has relevant chunks in ChromaDB.
+
+#### Solution: `source_files` as the Bidirectional Link Key
+
+The link between nodes and chunks is the **source filename**:
+- Nodes know which files they came from → `node.metadata["source_files"]`
+- Chunks know which file they came from → `chunk.metadata["source_file"]`
+- To find chunks for a node: get node's `source_files`, query ChromaDB with `where={"source_file": {"$in": [...]}}`
+
+```
+article_3.docx
+     │
+     ├──→ Node "Fairness"  (metadata.source_files = ["article_3.docx"])
+     ├──→ Node "Hiring"    (metadata.source_files = ["article_3.docx", "article_5.docx"])
+     │
+     └──→ Chunk 0 (metadata.source_file = "article_3.docx")
+          Chunk 1 (metadata.source_file = "article_3.docx")
+          Chunk 2 (metadata.source_file = "article_3.docx")
+```
+
+#### Implementation Plan — 4 Steps
+
+**Step 1: Store `source_files` in node metadata during ingestion**
+
+Modify `ingest_file()` in `backend/app/ingestion/ingest.py`. After concepts are activated (`mm.activate_concepts()`), update each activated node's metadata:
+
+```python
+for node_id in activated_ids:
+    node = mm.graph.get_node(node_id)
+    if node:
+        sources = list(node.metadata.get("source_files", []))
+        if file_data["filename"] not in sources:
+            sources.append(file_data["filename"])
+            mm.graph.update_node(node_id, metadata={**node.metadata, "source_files": sources})
+```
+
+A node extracted from 3 different documents will have `source_files: ["article_1.docx", "article_3.docx", "article_5.docx"]`.
+
+**Step 2: Graph-guided RAG retrieval (dual strategy)**
+
+Modify `retrieve_documents()` in `backend/app/agent/nodes.py`. Instead of only doing semantic search, also retrieve chunks from documents related to activated graph nodes:
+
+```python
+def retrieve_documents(state):
+    # Strategy 1: Pure semantic search (current)
+    semantic_chunks = doc_store.search(query, top_k=3)
+
+    # Strategy 2: Graph-guided — find chunks from source docs of activated nodes
+    source_files = set()
+    for nid in activated_ids:
+        node = mm.graph.get_node(nid)
+        if node and node.metadata.get("source_files"):
+            source_files.update(node.metadata["source_files"])
+
+    source_chunks = []
+    for sf in list(source_files)[:5]:
+        source_chunks.extend(doc_store.search(query, top_k=2, where={"source_file": sf}))
+
+    # Merge, deduplicate by chunk ID, return top 5
+    return deduplicated(semantic_chunks + source_chunks)[:5]
+```
+
+This gives **two retrieval strategies**:
+1. **Semantic**: "what chunks are textually similar to the query?"
+2. **Graph-guided**: "what chunks come from documents that produced the activated concepts?"
+
+The combination is more targeted — if the user asks about "fairness in hiring" and the graph activates "Fairness" (from article_3.docx), the graph-guided strategy will search WITHIN article_3.docx for relevant passages, even if those passages don't contain the exact words "fairness in hiring".
+
+**Step 3: Show source files in node tooltip (frontend)**
+
+Modify `nodeLabel` callback in `BrainGraph.tsx`. The node's `metadata.source_files` is already sent to the frontend. Add a "Sources" line to the tooltip:
+
+```tsx
+const sources = node.metadata?.source_files;
+// Add to tooltip HTML:
+${sources?.length ? `<div>Sources: ${sources.slice(0,3).join(', ')}</div>` : ''}
+```
+
+**Step 4: Add `DocumentStore.search_by_sources()` convenience method**
+
+Add to `document_store.py`:
+
+```python
+def search_by_sources(self, query: str, source_files: list[str], top_k: int = 3) -> list[dict]:
+    """Search within specific source files only."""
+    if not source_files or self._collection.count() == 0:
+        return []
+    return self.search(query, top_k=top_k, where={"source_file": {"$in": source_files}})
+```
+
+#### Files to Modify
+
+| File | Change |
+|---|---|
+| `backend/app/ingestion/ingest.py` | Store `source_files` in node metadata after activation |
+| `backend/app/agent/nodes.py` | Dual retrieval strategy in `retrieve_documents` |
+| `backend/app/graph_kb/document_store.py` | Add `search_by_sources()` method |
+| `frontend/src/components/BrainGraph/BrainGraph.tsx` | Show source files in node tooltip |
+
+#### What This Enables
+
+- **Smarter retrieval**: Graph knowledge guides document search, not just embeddings
+- **Provenance**: Every node knows which documents it came from
+- **Transparency**: Users see source files on hover, building trust in the graph
+- **Bidirectional navigation**: node → docs (via metadata), docs → nodes (via shared source_file key)
+
 ### File Ingestion
 - **inputs/ folder** with typed subfolders: documents, people, projects, knowledge, code, media, conversations, data
 - **.taxonomy.json** defines extraction hints per folder type

@@ -347,6 +347,16 @@ def ingest_file(
 
     activated_ids, diff = mm.activate_concepts(concept_dicts)
 
+    # Cross-link: store source filename in each activated node's metadata
+    source_filename = file_data["filename"]
+    for node_id in activated_ids:
+        node = mm.graph.get_node(node_id)
+        if node and not node.metadata.get("is_folder"):
+            sources = list(node.metadata.get("source_files", []))
+            if source_filename not in sources:
+                sources.append(source_filename)
+                mm.graph.update_node(node_id, metadata={**node.metadata, "source_files": sources})
+
     # Only link the top 3 most important new concepts to the folder node
     # (avoids creating a massive central hub)
     new_concepts_for_folder = [nid for nid in activated_ids if nid != folder_node_id][:3]

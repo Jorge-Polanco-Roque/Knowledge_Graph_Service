@@ -125,6 +125,14 @@ class DocumentStore:
 
         return chunks
 
+    def search_by_sources(
+        self, query: str, source_files: list[str], top_k: int = 3
+    ) -> list[dict[str, Any]]:
+        """Search within specific source files only (graph-guided retrieval)."""
+        if not source_files or self._collection.count() == 0:
+            return []
+        return self.search(query, top_k=top_k, where={"source_file": {"$in": source_files}})
+
     def delete_by_source(self, source_file: str) -> None:
         """Remove all chunks from a specific source file (for re-ingestion)."""
         try:

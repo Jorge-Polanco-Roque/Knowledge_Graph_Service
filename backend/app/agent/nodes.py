@@ -167,11 +167,11 @@ def activate_memory(state: AgentState) -> dict[str, Any]:
 # ------------------------------------------------------------------
 
 def retrieve_documents(state: AgentState) -> dict[str, Any]:
-    """Retrieve relevant document chunks via semantic search (RAG)."""
+    """Retrieve relevant document chunks via dual strategy: semantic + graph-guided."""
     user_id = state["user_id"]
     messages = state["messages"]
+    activated_ids = state.get("activated_ids", [])
 
-    # Use the latest user message as the search query
     query = ""
     for msg in reversed(messages):
         if msg.role == "user":
@@ -183,8 +183,33 @@ def retrieve_documents(state: AgentState) -> dict[str, Any]:
 
     try:
         doc_store = get_document_store(user_id)
-        chunks = doc_store.search(query)
-        return {"document_chunks": chunks}
+
+        # Strategy 1: Pure semantic search
+        semantic_chunks = doc_store.search(query, top_k=3)
+
+        # Strategy 2: Graph-guided — search within source docs of activated nodes
+        source_chunks: list[dict] = []
+        if activated_ids:
+            mm = _get_memory_manager(user_id)
+            source_files: set[str] = set()
+            for nid in activated_ids:
+                node = mm.graph.get_node(nid)
+                if node and node.metadata.get("source_files"):
+                    source_files.update(node.metadata["source_files"])
+            if source_files:
+                source_chunks = doc_store.search_by_sources(
+                    query, list(source_files)[:10], top_k=3
+                )
+
+        # Merge and deduplicate by chunk ID
+        seen_ids: set[str] = set()
+        merged: list[dict] = []
+        for chunk in semantic_chunks + source_chunks:
+            if chunk["id"] not in seen_ids:
+                seen_ids.add(chunk["id"])
+                merged.append(chunk)
+
+        return {"document_chunks": merged[:5]}
     except Exception as exc:
         logger.warning("Document retrieval failed: %s", exc)
         return {"document_chunks": []}

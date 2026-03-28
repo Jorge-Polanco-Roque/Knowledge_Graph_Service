@@ -253,11 +253,16 @@ export function BrainGraph() {
   const nodeLabel = useCallback((node: GraphNode) => {
     const memColor = node.memory_type === 'stm' ? '#00d4ff' : '#10b981';
     const memLabel = node.memory_type === 'stm' ? 'Short-term' : 'Long-term';
-    return `<div style="background:rgba(10,10,26,0.95);border:1px solid rgba(0,212,255,0.25);border-radius:10px;padding:10px 14px;font-family:Inter,system-ui;font-size:12px;color:#e6edf3;min-width:140px;">
+    const sources = (node.metadata?.source_files as string[] | undefined) || [];
+    const sourcesHtml = sources.length > 0
+      ? `<div style="margin-top:6px;padding-top:6px;border-top:1px solid rgba(0,212,255,0.1);"><div style="color:#8b949e;font-size:10px;margin-bottom:3px;">Sources</div>${sources.slice(0, 3).map((s: string) => `<div style="font-size:10px;color:#a78bfa;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:200px;">📄 ${s}</div>`).join('')}${sources.length > 3 ? `<div style="font-size:10px;color:#8b949e;">+${sources.length - 3} more</div>` : ''}</div>`
+      : '';
+    return `<div style="background:rgba(10,10,26,0.95);border:1px solid rgba(0,212,255,0.25);border-radius:10px;padding:10px 14px;font-family:Inter,system-ui;font-size:12px;color:#e6edf3;min-width:140px;max-width:260px;">
       <div style="font-weight:700;font-size:14px;margin-bottom:6px;color:${getNodeColor(node.id)};">${node.label}</div>
       <div style="display:flex;justify-content:space-between;margin-bottom:3px;"><span style="color:#8b949e;">Category</span><span>${node.category}</span></div>
       <div style="display:flex;justify-content:space-between;margin-bottom:3px;"><span style="color:#8b949e;">Memory</span><span style="color:${memColor};">${memLabel}</span></div>
       <div style="display:flex;justify-content:space-between;"><span style="color:#8b949e;">Importance</span><span>${(node.importance * 100).toFixed(0)}%</span></div>
+      ${sourcesHtml}
     </div>`;
   }, [getNodeColor]);
 

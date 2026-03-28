@@ -37,7 +37,8 @@ The application features a split-view interface: a **3D interactive brain visual
 - **3D Neural Visualization** — Interactive, rotatable 3D graph with cluster detection, color-coded communities, and real-time animation of graph changes
 - **Node Search** — Autocomplete search bar to find and fly to any node in the graph, with cluster color and importance indicators
 - **Markdown Chat** — AI responses rendered with full Markdown support (bold, italic, lists, code blocks, headings)
-- **RAG (Retrieval-Augmented Generation)** — Document chunks stored in ChromaDB with OpenAI embeddings. At query time, semantically relevant passages are retrieved and injected into the LLM context, enabling the agent to cite specific document excerpts
+- **RAG (Retrieval-Augmented Generation)** — Document chunks stored in ChromaDB with OpenAI embeddings. Dual retrieval strategy: semantic search + graph-guided search (finds chunks from documents linked to activated graph nodes). Agent cites specific document excerpts
+- **Graph ↔ Document Cross-Linking** — Every node tracks which documents it was extracted from (`source_files` metadata). Hover a node to see its source documents. Enables bidirectional navigation between structured knowledge and raw evidence
 - **Intelligent Agent** — Critical thinking system prompt that challenges false premises, grounds responses in graph knowledge via fuzzy concept matching, and validates relationship types
 - **AI-Powered Concept Extraction** — GPT-4o extracts entities, relationships, and semantic meaning from natural conversation
 - **File Ingestion** — Ingest documents (.docx, .pdf, .xlsx, .pptx, .csv, .json, .txt, .md), code files, and images (via GPT-4o vision) to bootstrap your knowledge graph
