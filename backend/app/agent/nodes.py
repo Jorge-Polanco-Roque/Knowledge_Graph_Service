@@ -337,7 +337,80 @@ def generate_response(state: AgentState) -> dict[str, Any]:
     llm = _get_llm()
     response = llm.invoke(llm_messages)
 
-    return {"response": response.content}
+    # Post-processing: grounding check — flag unverified specific claims
+    grounded_response = _grounding_check(response.content, graph_context)
+
+    return {"response": grounded_response}
+
+
+# ------------------------------------------------------------------
+# Grounding check — post-processing to catch hallucinations
+# ------------------------------------------------------------------
+
+import re as _re
+
+# Patterns that extract specific claims (article numbers, statistics, etc.)
+_SPECIFIC_CLAIM_PATTERNS = [
+    # "Article 52", "Artículo 14", "Section 3.2"
+    _re.compile(r'\b(?:article|artículo|section|sección)\s+(\d+(?:\.\d+)?)\b', _re.IGNORECASE),
+    # "73%", "42.5%"
+    _re.compile(r'\b(\d+(?:\.\d+)?)\s*%'),
+    # "(Smith et al., 2023)", "(Holstein, 2019)"
+    _re.compile(r'\(([A-Z][a-z]+(?:\s+et\s+al\.?)?),?\s*\d{4}\)'),
+    # "a study by Smith (2023)", "research by Holstein et al."
+    _re.compile(r'(?:study|research|paper|investigación)\s+(?:by|de|por)\s+([A-Z][a-z]+(?:\s+et\s+al\.?)?)', _re.IGNORECASE),
+    # Specific years as claims: "in 2019", "en 2023"
+    _re.compile(r'\b(?:in|en|from|since|desde)\s+((?:19|20)\d{2})\b'),
+]
+
+
+def _grounding_check(response: str, context: str) -> str:
+    """Check if specific claims in the response are grounded in the context.
+
+    Appends a disclaimer for any unverified specific claims (article numbers,
+    statistics, author citations, dates). Does NOT modify the response text —
+    only appends a transparency note if issues are found.
+    """
+    if not context or not response:
+        return response
+
+    context_lower = context.lower()
+    ungrounded: list[str] = []
+
+    for pattern in _SPECIFIC_CLAIM_PATTERNS:
+        for match in pattern.finditer(response):
+            claim = match.group(0).strip()
+            # Check if this specific claim appears anywhere in the context
+            if claim.lower() not in context_lower:
+                # Also check if the key identifier (number, name) is in context
+                key = match.group(1) if match.lastindex else claim
+                if key.lower() not in context_lower:
+                    ungrounded.append(claim)
+
+    if not ungrounded:
+        return response
+
+    # Deduplicate
+    seen = set()
+    unique = []
+    for c in ungrounded:
+        if c.lower() not in seen:
+            seen.add(c.lower())
+            unique.append(c)
+
+    if len(unique) <= 2:
+        # Minor: just a few ungrounded claims, might be common knowledge
+        return response
+
+    # Significant number of ungrounded claims — add disclaimer
+    disclaimer = (
+        "\n\n---\n"
+        "*Note: Some specific details in this response (e.g., "
+        + ", ".join(f'"{c}"' for c in unique[:3])
+        + ") could not be verified against my knowledge base and may be approximate.*"
+    )
+    logger.info("Grounding check: %d unverified claims in response", len(unique))
+    return response + disclaimer
 
 
 # ------------------------------------------------------------------

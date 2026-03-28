@@ -28,6 +28,7 @@ def _check_injection(content: str) -> bool:
 from ..agent.nodes import (
     SYSTEM_PROMPT,
     _get_memory_manager,
+    _grounding_check,
     activate_memory,
     build_context,
     extract_concepts,
@@ -217,6 +218,19 @@ async def _run_agent_streaming(
                 })
             except Exception:
                 break  # WebSocket disconnected mid-stream
+
+    # Post-processing: grounding check — append disclaimer if unverified claims found
+    full_response = _grounding_check(full_response, graph_context)
+    if full_response.endswith("*") and "\n\n---\n" in full_response:
+        # Grounding disclaimer was added — send it as final chunk
+        disclaimer = full_response[full_response.rindex("\n\n---\n"):]
+        try:
+            await websocket.send_json({
+                "type": WSMessageType.RESPONSE_CHUNK.value,
+                "data": {"content": disclaimer},
+            })
+        except Exception:
+            pass
 
     state["response"] = full_response
 
