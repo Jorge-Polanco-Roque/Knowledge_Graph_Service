@@ -254,6 +254,149 @@ logger = logging.getLogger(__name__)
 | U1: Context poisoning | ALTA (trust violation) | 5 min | 4 |
 | U5: Self-reference | MEDIA (reasoning gap) | 5 min | 5 |
 
+### Fix V1: Self-Knowledge Correction — Agent Must Know It Learns in Real Time
+
+**Problem**: The agent says "no estoy aprendiendo en tiempo real" — but it IS. Every message triggers `extract_concepts → activate_memory → update_graph`, which applies Hebbian learning, LTP, LTD, consolidation. The graph changes on every turn. The agent lies about itself because the system prompt doesn't explicitly state this.
+
+**Solution**: Add to the "About You" section in SYSTEM_PROMPT:
+
+```
+**IMPORTANT — You ARE learning right now.** Every message in this conversation modifies
+your knowledge graph in real time: new concepts are extracted, connections strengthen
+via Hebbian learning, importance grows through LTP, and unused connections decay via LTD.
+Your graph is different now than when this conversation started. You are not static.
+```
+
+**Files**: `backend/app/agent/nodes.py` (SYSTEM_PROMPT)
+
+---
+
+### Fix V2: Frontend Feedback Buttons (Thumbs Up/Down)
+
+**Problem**: The backend endpoint `POST /api/feedback/{user_id}` exists and works, but there are no UI buttons to use it. Users can't give feedback on responses.
+
+**Solution**: Add thumbs up/down buttons on every assistant message in the chat.
+
+#### Implementation — 4 Steps
+
+**Step 1: Add `id` and `feedback` to ChatMessage type**
+
+`frontend/src/types/messages.ts`:
+```typescript
+export interface ChatMessage {
+  role: MessageRole;
+  content: string;
+  timestamp: string;
+  concepts?: { id: string; label: string; category: string }[];
+  id?: string;          // Unique message ID for feedback tracking
+  feedback?: 1 | -1;    // 1 = thumbs up, -1 = thumbs down
+}
+```
+
+**Step 2: Generate message ID in WebSocket handler**
+
+`frontend/src/hooks/useWebSocket.ts` — when creating an assistant message (in `response_chunk` handler), generate a unique ID:
+
+```typescript
+// When first chunk arrives, create message with ID
+const msgId = `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+msgs.push({
+  role: 'assistant',
+  content: chunk,
+  timestamp: new Date().toISOString(),
+  id: msgId,
+});
+```
+
+**Step 3: Add feedback buttons in MessageBubble**
+
+`frontend/src/components/Chat/ChatPanel.tsx` — for assistant messages, render feedback buttons after the concept tags:
+
+```tsx
+// In MessageBubble, after concept tags:
+{!isUser && message.id && (
+  <div style={{ display: 'flex', gap: '8px', marginTop: '6px' }}>
+    <button
+      onClick={() => handleFeedback(message.id!, 1)}
+      style={{
+        background: message.feedback === 1 ? 'rgba(16,185,129,0.2)' : 'transparent',
+        border: `1px solid ${message.feedback === 1 ? '#10b981' : '#8b949e40'}`,
+        borderRadius: '6px', padding: '2px 8px', cursor: 'pointer',
+        fontSize: '14px', color: message.feedback === 1 ? '#10b981' : '#8b949e',
+      }}
+      disabled={message.feedback !== undefined}
+    >
+      👍
+    </button>
+    <button
+      onClick={() => handleFeedback(message.id!, -1)}
+      style={{
+        background: message.feedback === -1 ? 'rgba(239,68,68,0.2)' : 'transparent',
+        border: `1px solid ${message.feedback === -1 ? '#ef4444' : '#8b949e40'}`,
+        borderRadius: '6px', padding: '2px 8px', cursor: 'pointer',
+        fontSize: '14px', color: message.feedback === -1 ? '#ef4444' : '#8b949e',
+      }}
+      disabled={message.feedback !== undefined}
+    >
+      👎
+    </button>
+  </div>
+)}
+```
+
+**Step 4: Feedback submission function**
+
+```typescript
+const handleFeedback = async (messageId: string, rating: 1 | -1) => {
+  // Find the query (previous user message)
+  const msgIndex = messages.findIndex(m => m.id === messageId);
+  const query = msgIndex > 0 ? messages[msgIndex - 1].content : '';
+  const response = messages[msgIndex]?.content || '';
+
+  // Send to backend
+  await fetch(`/api/feedback/default-user`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message_id: messageId, rating, query, response, timestamp: new Date().toISOString() }),
+  });
+
+  // Update message state to show feedback was given
+  // Via a new store method: setMessageFeedback(messageId, rating)
+};
+```
+
+**Step 5: Store method to update feedback**
+
+`frontend/src/hooks/useGraphStore.ts`:
+```typescript
+setMessageFeedback: (messageId: string, feedback: 1 | -1) =>
+  set((state) => ({
+    messages: state.messages.map(m =>
+      m.id === messageId ? { ...m, feedback } : m
+    ),
+  })),
+```
+
+#### UX Flow
+
+```
+1. Agent responds → message appears with 👍 👎 buttons (gray, subtle)
+2. User clicks 👍 → button turns green, 👎 disabled
+3. POST /api/feedback/{user_id} sends rating + query + response
+4. Feedback persisted as JSONL on backend
+5. Cannot change feedback after clicking (disabled state)
+```
+
+#### Files to Modify
+
+| File | Change |
+|---|---|
+| `backend/app/agent/nodes.py` | Fix self-knowledge: "You ARE learning right now" |
+| `frontend/src/types/messages.ts` | Add `id` and `feedback` fields to ChatMessage |
+| `frontend/src/hooks/useWebSocket.ts` | Generate message ID on first chunk |
+| `frontend/src/hooks/useGraphStore.ts` | Add `setMessageFeedback` method |
+| `frontend/src/components/Chat/ChatPanel.tsx` | Add feedback buttons + submission handler |
+
 ### Performance Optimizations (validated through stress testing)
 
 #### Stress Test Results (pre-optimization, 504 nodes, 1326 edges)

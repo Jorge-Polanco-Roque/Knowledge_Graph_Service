@@ -112,10 +112,22 @@ export const useGraphStore = create<GraphState>((set) => ({
       if (last && last.role === 'assistant') {
         msgs[msgs.length - 1] = { ...last, content: last.content + chunk };
       } else {
-        msgs.push({ role: 'assistant', content: chunk, timestamp: new Date().toISOString() });
+        msgs.push({
+          role: 'assistant',
+          content: chunk,
+          timestamp: new Date().toISOString(),
+          id: `msg_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        });
       }
       return { messages: msgs, isLoading: false };
     }),
+
+  setMessageFeedback: (messageId: string, feedback: 1 | -1) =>
+    set((state) => ({
+      messages: state.messages.map(m =>
+        m.id === messageId ? { ...m, feedback } : m
+      ),
+    })),
 
   setConnected: (val: boolean) =>
     set({ isConnected: val }),

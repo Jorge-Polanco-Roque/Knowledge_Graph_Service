@@ -13,11 +13,31 @@ const CATEGORY_COLORS: Record<string, string> = {
   event: '#f59e0b',
 };
 
-function MessageBubble({ message }: { message: ChatMessage }) {
+function MessageBubble({ message, messages }: { message: ChatMessage; messages: ChatMessage[] }) {
   const isUser = message.role === 'user';
+  const setMessageFeedback = useGraphStore((s) => s.setMessageFeedback);
 
   // Use per-message concepts (static snapshot) instead of global activatedNodes
   const conceptTags = (!isUser && message.concepts) ? message.concepts.slice(0, 6) : [];
+
+  const handleFeedback = async (rating: 1 | -1) => {
+    if (!message.id || message.feedback !== undefined) return;
+    // Find the query (previous user message)
+    const msgIndex = messages.findIndex(m => m.id === message.id);
+    const query = msgIndex > 0 ? messages[msgIndex - 1].content : '';
+    setMessageFeedback(message.id, rating);
+    try {
+      await fetch('/api/feedback/default-user', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          message_id: message.id, rating, query,
+          response: message.content,
+          timestamp: new Date().toISOString(),
+        }),
+      });
+    } catch { /* silently fail */ }
+  };
 
   return (
     <motion.div
@@ -120,6 +140,38 @@ function MessageBubble({ message }: { message: ChatMessage }) {
             </span>
           ))}
         </motion.div>
+      )}
+
+      {/* Feedback buttons */}
+      {!isUser && message.id && (
+        <div style={{ display: 'flex', gap: '6px', marginTop: '6px', paddingLeft: isUser ? 0 : '4px' }}>
+          <button
+            onClick={() => handleFeedback(1)}
+            disabled={message.feedback !== undefined}
+            style={{
+              background: message.feedback === 1 ? 'rgba(16,185,129,0.15)' : 'transparent',
+              border: `1px solid ${message.feedback === 1 ? '#10b981' : 'rgba(139,148,158,0.25)'}`,
+              borderRadius: '6px', padding: '2px 10px', cursor: message.feedback !== undefined ? 'default' : 'pointer',
+              fontSize: '13px', color: message.feedback === 1 ? '#10b981' : '#8b949e',
+              transition: 'all 0.15s', opacity: message.feedback === -1 ? 0.3 : 1,
+            }}
+          >
+            👍
+          </button>
+          <button
+            onClick={() => handleFeedback(-1)}
+            disabled={message.feedback !== undefined}
+            style={{
+              background: message.feedback === -1 ? 'rgba(239,68,68,0.15)' : 'transparent',
+              border: `1px solid ${message.feedback === -1 ? '#ef4444' : 'rgba(139,148,158,0.25)'}`,
+              borderRadius: '6px', padding: '2px 10px', cursor: message.feedback !== undefined ? 'default' : 'pointer',
+              fontSize: '13px', color: message.feedback === -1 ? '#ef4444' : '#8b949e',
+              transition: 'all 0.15s', opacity: message.feedback === 1 ? 0.3 : 1,
+            }}
+          >
+            👎
+          </button>
+        </div>
       )}
     </motion.div>
   );
@@ -254,7 +306,7 @@ export function ChatPanel() {
 
       <AnimatePresence>
         {messages.map((msg, idx) => (
-          <MessageBubble key={`${idx}-${msg.timestamp}`} message={msg} />
+          <MessageBubble key={`${idx}-${msg.timestamp}`} message={msg} messages={messages} />
         ))}
       </AnimatePresence>
 
