@@ -2875,6 +2875,568 @@ const handleDrop = async (e: DragEvent) => {
 
 **Total estimated effort**: ~18 hours across all 9 items. R1+R3+R6 can be done in under 1 hour combined.
 
+---
+
+## Roadmap Phase 2: Advanced Features (8 Plans)
+
+### S1: Query Routing — Adaptive Pipeline Selection
+
+#### Problem
+
+Every query runs the full pipeline: extract_concepts → activate_memory → retrieve_documents → build_context → generate_response → update_graph. A simple "Hola" goes through concept extraction, embedding cache, ChromaDB search, and spreading activation — ~5s for a response that should take <1s.
+
+Meanwhile, a complex research question like "Compare the EU AI Act approach to fairness metrics with the GDPR Article 22 requirements" needs maximum context (more chunks, deeper spreading). The pipeline treats both identically.
+
+#### Solution: LLM-based query classifier
+
+Before running the full pipeline, classify the query into one of 3 routes using a fast, cheap LLM call (or GPT-4o-mini):
+
+| Route | When | Pipeline | Expected latency |
+|---|---|---|---|
+| `greeting` | "Hola", "Thanks", "Ok" | Skip everything → direct LLM response | <1s |
+| `simple` | Single concept question: "What is fairness?" | RAG search (top 5), no spreading | ~2s |
+| `complex` | Multi-concept, comparison, analysis | Full pipeline: RAG (top 10) + spreading | ~4-6s |
+
+#### Implementation
+
+**Step 1**: Add classifier in `nodes.py` before the pipeline:
+
+```python
+ROUTING_PROMPT = """Classify this user message into one category:
+- "greeting" if it's a greeting, thanks, acknowledgment, or casual chat
+- "simple" if it asks about one concept or needs a direct factual answer
+- "complex" if it compares concepts, asks for analysis, or requires synthesizing multiple sources
+
+Message: {message}
+
+Reply with ONLY one word: greeting, simple, or complex."""
+
+def classify_query(message: str) -> str:
+    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0, max_tokens=10)
+    response = llm.invoke([{"role": "user", "content": ROUTING_PROMPT.format(message=message)}])
+    route = response.content.strip().lower()
+    if route not in ("greeting", "simple", "complex"):
+        return "simple"  # Default fallback
+    return route
+```
+
+**Step 2**: In `websocket.py`, route before running the pipeline:
+
+```python
+route = await loop.run_in_executor(None, classify_query, content)
+
+if route == "greeting":
+    # Skip pipeline entirely — direct LLM response
+    llm = ChatOpenAI(model=settings.openai_model, streaming=True)
+    async for chunk in llm.astream([
+        {"role": "system", "content": "You are NeuroGraph. Respond briefly and friendly."},
+        {"role": "user", "content": content},
+    ]):
+        await websocket.send_json({"type": "response_chunk", "data": {"content": chunk.content}})
+    # Send response_end with no concepts/diff
+elif route == "simple":
+    # RAG only, no spreading activation
+    state.update(extract_concepts(state))
+    state.update(retrieve_documents(state))  # Skip activate_memory
+    state.update(build_context(state))
+    # Stream response...
+else:
+    # Full pipeline
+    state.update(extract_concepts(state))
+    state.update(activate_memory(state))
+    state.update(retrieve_documents(state))
+    state.update(build_context(state))
+    # Stream response...
+```
+
+**Cost**: 1 extra API call to GPT-4o-mini per query (~10 tokens, ~$0.000001). Saves 3-8s on greeting/simple queries.
+
+**Files to modify**:
+| File | Change |
+|---|---|
+| `backend/app/agent/nodes.py` | Add `classify_query()` function |
+| `backend/app/api/websocket.py` | Route based on classification |
+| `backend/app/config.py` | Add `routing_model: str = "gpt-4o-mini"` setting |
+
+---
+
+### S2: User Feedback Loop — Learn from Corrections
+
+#### Problem
+
+No way to measure if responses are good. No way for the agent to improve from user feedback. We can stress-test manually, but real users encounter edge cases we can't predict.
+
+#### Solution: Thumbs up/down on each message, stored with query + response + context used.
+
+#### Implementation
+
+**Step 1**: Backend model and storage:
+
+```python
+# models/feedback.py
+class ResponseFeedback(BaseModel):
+    message_id: str
+    user_id: str
+    rating: int  # 1 = thumbs up, -1 = thumbs down
+    query: str
+    response: str
+    chunks_used: list[str]  # chunk IDs
+    timestamp: datetime
+```
+
+Storage: `data/users/{user_id}/feedback.jsonl` (append-only, one JSON per line).
+
+**Step 2**: REST endpoint:
+
+```python
+@router.post("/api/feedback/{user_id}")
+async def submit_feedback(user_id: str, feedback: dict) -> dict:
+    # Append to JSONL file
+    filepath = settings.data_dir / "users" / user_id / "feedback.jsonl"
+    with open(filepath, "a") as f:
+        f.write(json.dumps(feedback) + "\n")
+    return {"status": "ok"}
+```
+
+**Step 3**: Frontend — thumbs up/down buttons on each assistant message:
+
+```tsx
+// In MessageBubble, for assistant messages:
+<div className="feedback-buttons">
+    <button onClick={() => submitFeedback(1)}>👍</button>
+    <button onClick={() => submitFeedback(-1)}>👎</button>
+</div>
+```
+
+**Step 4**: Analytics endpoint to review feedback:
+
+```python
+@router.get("/api/feedback/{user_id}/summary")
+async def feedback_summary(user_id: str) -> dict:
+    # Read JSONL, compute: total, positive, negative, worst queries
+    return {
+        "total": 42,
+        "positive": 35,
+        "negative": 7,
+        "worst_queries": [...]  # Queries with thumbs down
+    }
+```
+
+**Step 5 (future)**: Use negative feedback to adjust chunk retrieval:
+- Chunks that appear in thumbs-down responses get a penalty score
+- Re-rank search results: `adjusted_score = distance + penalty * 0.1`
+- Persistent per-chunk penalties in a separate file
+
+**Files to create/modify**:
+| File | Change |
+|---|---|
+| `backend/app/api/routes.py` | Add feedback endpoints |
+| `frontend/src/types/messages.ts` | Add `message_id` to ChatMessage |
+| `frontend/src/components/Chat/ChatPanel.tsx` | Add thumbs up/down buttons |
+| `frontend/src/hooks/useWebSocket.ts` | Generate message_id, submit feedback |
+
+---
+
+### S3: Semantic Chunking — Paragraph-Aware Splitting
+
+#### Problem
+
+Current chunking splits by character count (600 chars, 100 overlap). This cuts mid-sentence, mid-paragraph, even mid-word. A chunk might contain the end of one idea and the start of another, making it noisy for retrieval.
+
+Example of a bad split:
+```
+Chunk 1: "...fairness metrics should be evaluated across all protected groups. The four-fi"
+Chunk 2: "fths rule states that selection rates must be at least 80% of the highest group..."
+```
+
+The concept "four-fifths rule" is split across two chunks. Neither chunk alone contains the full idea.
+
+#### Solution: Semantic chunking that respects paragraph and topic boundaries.
+
+#### Implementation
+
+**Option A — Paragraph-first splitting** (simple, no extra API calls):
+
+```python
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
+splitter = RecursiveCharacterTextSplitter(
+    chunk_size=800,          # Larger chunks for better coherence
+    chunk_overlap=150,       # More overlap
+    separators=[
+        "\n\n\n",            # Section breaks
+        "\n\n",              # Paragraph breaks
+        "\n",                # Line breaks
+        ". ",                # Sentence endings
+        "? ",                # Question endings
+        "! ",                # Exclamation endings
+        " ",                 # Word breaks (last resort)
+    ],
+    length_function=len,
+)
+```
+
+**Option B — Semantic chunking** (uses embeddings to detect topic shifts):
+
+```python
+from langchain_experimental.text_splitter import SemanticChunker
+from langchain_openai import OpenAIEmbeddings
+
+chunker = SemanticChunker(
+    OpenAIEmbeddings(model="text-embedding-3-small"),
+    breakpoint_threshold_type="percentile",
+    breakpoint_threshold_amount=75,  # Split when similarity drops below 75th percentile
+)
+chunks = chunker.split_text(content)
+```
+
+**Recommendation**: Start with Option A (zero extra cost). Upgrade to Option B if chunk quality is still an issue.
+
+**Files to modify**:
+| File | Change |
+|---|---|
+| `backend/app/graph_kb/document_store.py` | Update splitter config (separators, sizes) |
+| `backend/app/config.py` | Add `rag_chunk_size: int = 800`, `rag_chunk_overlap: int = 150` |
+| `backend/pyproject.toml` | (Option B only) Add `langchain-experimental` |
+
+---
+
+### S4: Graph Evolution Timeline
+
+#### Problem
+
+The graph is a snapshot — the user can't see how it evolved. Which concepts appeared first? Which connections strengthened over time? Which were pruned? This history is lost.
+
+#### Solution: Save timestamped graph snapshots. Frontend slider to navigate through time.
+
+#### Implementation
+
+**Step 1**: Save snapshot on significant events (ingestion, conversation end, dedup):
+
+```python
+# In memory.py or a new timeline.py:
+def save_snapshot(user_id: str, event: str) -> None:
+    timeline_dir = settings.data_dir / "users" / user_id / "timeline"
+    timeline_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    snapshot = mm.get_full_snapshot()
+    filepath = timeline_dir / f"{timestamp}_{event}.json"
+    filepath.write_text(snapshot.model_dump_json())
+```
+
+Events that trigger snapshot: `ingestion_complete`, `conversation_end`, `deduplication`, `pruning`.
+
+**Step 2**: REST endpoints:
+
+```python
+@router.get("/api/graph/{user_id}/timeline")
+async def list_snapshots(user_id: str) -> list[dict]:
+    """List all timeline snapshots with timestamp and event type."""
+    # Returns: [{"timestamp": "...", "event": "ingestion", "nodes": 304, "edges": 2607}, ...]
+
+@router.get("/api/graph/{user_id}/timeline/{snapshot_id}")
+async def get_snapshot(user_id: str, snapshot_id: str) -> dict:
+    """Load a specific historical snapshot."""
+```
+
+**Step 3**: Frontend — timeline slider below the graph:
+
+```tsx
+<input type="range" min={0} max={snapshots.length - 1}
+    value={currentSnapshot}
+    onChange={(e) => loadSnapshot(snapshots[e.target.value])}
+/>
+<span>{snapshots[currentSnapshot].timestamp} — {snapshots[currentSnapshot].event}</span>
+```
+
+When the slider changes, replace the current graph data with the historical snapshot.
+
+**Storage**: Each snapshot is ~100-500KB JSON. 100 snapshots ≈ 50MB. Manageable.
+
+**Files to create/modify**:
+| File | Change |
+|---|---|
+| `backend/app/graph_kb/timeline.py` | **New** — save/list/load snapshots |
+| `backend/app/api/routes.py` | Add timeline endpoints |
+| `frontend/src/components/BrainGraph/TimelineSlider.tsx` | **New** — slider component |
+| `frontend/src/components/BrainGraph/BrainGraph.tsx` | Integrate slider, swap graphData |
+
+---
+
+### S5: Document Comparison
+
+#### Problem
+
+User asks "¿Qué dice article_1 vs article_3 sobre fairness?" but the RAG treats it as a regular search — returns chunks from any document, not specifically from article_1 and article_3. The agent can't do targeted comparisons.
+
+#### Solution: Detect document references in the query and filter RAG search per document.
+
+#### Implementation
+
+**Step 1**: Document reference detector:
+
+```python
+import re
+
+def detect_document_refs(query: str, known_files: list[str]) -> list[str]:
+    """Extract document references from a user query."""
+    refs = []
+    query_lower = query.lower()
+
+    # Pattern 1: "article_1", "article_3.docx"
+    for match in re.finditer(r'article[_\s]?(\d+)(?:\.docx)?', query_lower):
+        filename = f"article_{match.group(1)}.docx"
+        # Find in known files (may be in different folders)
+        matching = [f for f in known_files if f.endswith(filename)]
+        refs.extend(matching)
+
+    # Pattern 2: Exact filename mentions
+    for f in known_files:
+        basename = f.split('/')[-1].lower()
+        if basename in query_lower:
+            refs.append(f)
+
+    return list(set(refs))
+```
+
+**Step 2**: In `retrieve_documents`, if refs are detected, do per-document search:
+
+```python
+refs = detect_document_refs(query, all_source_files)
+if len(refs) >= 2:
+    # Comparison mode: search within each document separately
+    chunks = []
+    for ref in refs:
+        doc_chunks = doc_store.search(query, top_k=3, where={"source_file": ref})
+        for c in doc_chunks:
+            c["metadata"]["comparison_group"] = ref
+        chunks.extend(doc_chunks)
+    return {"document_chunks": chunks}
+```
+
+**Step 3**: In `build_context`, group chunks by document for the comparison prompt:
+
+```
+## Document Comparison
+
+### From [article_1.docx]:
+"Fairness in hiring requires evaluating disparate impact..."
+
+### From [article_3.docx]:
+"The Fairness Audit Playbook recommends a risk-based approach..."
+```
+
+**Files to modify**:
+| File | Change |
+|---|---|
+| `backend/app/agent/nodes.py` | Add `detect_document_refs()`, modify `retrieve_documents` and `build_context` |
+| `backend/app/graph_kb/document_store.py` | Add method to list all known source_files |
+
+---
+
+### S6: Node Confidence Visualization
+
+#### Problem
+
+All nodes look the same in the 3D graph regardless of how well they're grounded in documents. A node extracted from 5 documents with 20 connections looks identical to a stub node with 1 connection and no source files.
+
+#### Solution: Visual encoding of node "confidence" based on groundedness.
+
+#### Implementation
+
+**Confidence score formula**:
+
+```python
+def compute_confidence(node: NodeData) -> float:
+    """0.0 to 1.0 confidence score based on groundedness."""
+    sources = len(node.metadata.get("source_files", []))
+    edges = len(graph.edges_of_node(node.id))
+    activation = node.activation_count
+
+    # Weighted factors
+    source_score = min(sources / 3, 1.0)    # 3+ sources = max
+    edge_score = min(edges / 10, 1.0)       # 10+ edges = max
+    activation_score = min(activation / 5, 1.0)  # 5+ activations = max
+
+    return source_score * 0.5 + edge_score * 0.3 + activation_score * 0.2
+```
+
+**Visual encoding in BrainGraph.tsx**:
+
+```tsx
+// In createPillTexture, modulate opacity by confidence:
+ctx.globalAlpha = 0.4 + confidence * 0.6;  // Low confidence = semi-transparent
+
+// Or: border style
+if (confidence < 0.3) {
+    ctx.setLineDash([4, 3]);  // Dashed border for low confidence
+}
+```
+
+**Backend**: Compute confidence in the graph snapshot and send as node metadata.
+
+**Files to modify**:
+| File | Change |
+|---|---|
+| `backend/app/graph_kb/knowledge_graph.py` | Add `compute_confidence()` to snapshot |
+| `frontend/src/components/BrainGraph/BrainGraph.tsx` | Modulate opacity/border by confidence |
+
+---
+
+### S7: Knowledge Gap Detection
+
+#### Problem
+
+The graph may have concept nodes that aren't backed by any document evidence. These are "gaps" — the system knows about a concept (from conversation or inference) but has no source material to ground it. The user doesn't know which parts of the knowledge base are well-supported vs speculative.
+
+#### Solution: Analyze cross-linking coverage and report gaps.
+
+#### Implementation
+
+**Step 1**: Gap analysis function:
+
+```python
+def detect_knowledge_gaps(graph: KnowledgeGraph, doc_store: DocumentStore) -> dict:
+    """Find nodes without document evidence."""
+    all_nodes = graph.all_nodes()
+    gaps = []
+    well_grounded = []
+
+    for node in all_nodes:
+        if node.metadata.get("is_folder"):
+            continue
+        sources = node.metadata.get("source_files", [])
+        edges = len(graph.edges_of_node(node.id))
+
+        if not sources and edges > 0:
+            gaps.append({
+                "id": node.id,
+                "label": node.label,
+                "importance": node.importance,
+                "edges": edges,
+                "reason": "No source documents",
+            })
+        elif sources and edges > 3:
+            well_grounded.append(node.label)
+
+    # Cluster-level gaps
+    clusters = graph.detect_clusters()
+    cluster_gaps = []
+    for cluster in clusters["clusters"]:
+        cluster_nodes = [graph.get_node(nid) for nid in cluster["node_ids"]]
+        cluster_nodes = [n for n in cluster_nodes if n]
+        with_sources = sum(1 for n in cluster_nodes if n.metadata.get("source_files"))
+        coverage = with_sources / max(len(cluster_nodes), 1)
+        if coverage < 0.5:
+            cluster_gaps.append({
+                "cluster": cluster["label"],
+                "size": cluster["size"],
+                "coverage": f"{coverage:.0%}",
+            })
+
+    return {
+        "total_nodes": len(all_nodes),
+        "nodes_with_sources": sum(1 for n in all_nodes if n.metadata.get("source_files")),
+        "gap_nodes": sorted(gaps, key=lambda g: g["importance"], reverse=True)[:20],
+        "cluster_gaps": cluster_gaps,
+        "well_grounded_count": len(well_grounded),
+    }
+```
+
+**Step 2**: REST endpoint:
+
+```python
+@router.get("/api/graph/{user_id}/gaps")
+async def knowledge_gaps(user_id: str) -> dict:
+    mm = _get_memory_manager(user_id)
+    doc_store = get_document_store(user_id)
+    return detect_knowledge_gaps(mm.graph, doc_store)
+```
+
+**Step 3** (optional): Frontend — "Knowledge Gaps" panel showing which concepts need more documentation.
+
+**Files to create/modify**:
+| File | Change |
+|---|---|
+| `backend/app/graph_kb/knowledge_graph.py` | Add `detect_knowledge_gaps()` |
+| `backend/app/api/routes.py` | Add `GET /api/graph/{user_id}/gaps` |
+
+---
+
+### S8: Language-Aware Responses
+
+#### Problem
+
+Documents are in English. Users ask in Spanish, Chinese, Arabic. The agent sometimes responds in the wrong language, mixes languages mid-response, or translates document content inconsistently.
+
+#### Solution: Detect query language and instruct the LLM to respond consistently.
+
+#### Implementation
+
+**Step 1**: Simple language detection (no extra dependency):
+
+```python
+def detect_language(text: str) -> str:
+    """Simple heuristic language detection from first 200 chars."""
+    sample = text[:200].lower()
+
+    # Spanish indicators
+    if any(w in sample for w in ["qué", "cómo", "cuál", "dónde", "por qué", "explica", "dime"]):
+        return "es"
+    # Check for non-Latin scripts
+    if any('\u4e00' <= c <= '\u9fff' for c in sample):
+        return "zh"
+    if any('\u0600' <= c <= '\u06ff' for c in sample):
+        return "ar"
+
+    return "en"  # Default
+```
+
+**Step 2**: In `build_context` or `generate_response`, inject language instruction:
+
+```python
+lang = detect_language(query)
+lang_instruction = {
+    "es": "Responde completamente en español.",
+    "zh": "请用中文回答。",
+    "ar": "أجب بالعربية.",
+    "en": "",  # Default, no instruction needed
+}.get(lang, "")
+
+if lang_instruction:
+    context += f"\n\n## Language Instruction\n{lang_instruction}"
+```
+
+**Step 3** (better): Use `langdetect` library for robust detection:
+
+```python
+from langdetect import detect
+lang = detect(query)  # Returns "es", "en", "zh-cn", etc.
+```
+
+**Files to modify**:
+| File | Change |
+|---|---|
+| `backend/app/agent/nodes.py` | Add `detect_language()`, inject instruction in `build_context` |
+| `backend/pyproject.toml` | (optional) Add `langdetect>=1.0` |
+
+---
+
+### Phase 2 Implementation Order & Effort Summary
+
+| # | Plan | Priority | Effort | Impact |
+|---|---|---|---|---|
+| S1 | Query Routing | High | 3h | Latency: <1s for greetings, right-sized pipeline per query |
+| S2 | User Feedback | High | 3h | Only path to data-driven improvement |
+| S3 | Semantic Chunking | High | 1h | Better chunk quality = better RAG answers |
+| S4 | Graph Timeline | Medium | 4h | Visual understanding of knowledge evolution |
+| S5 | Document Comparison | Medium | 2h | Targeted per-document analysis |
+| S6 | Node Confidence | Medium | 2h | Visual trust signal in the graph |
+| S7 | Knowledge Gaps | Medium | 2h | Identifies what's missing in the knowledge base |
+| S8 | Language-Aware | Low | 1h | Consistent multilingual responses |
+
+**Total estimated effort**: ~18 hours. S1+S3+S8 can be done in ~5 hours for highest immediate impact.
+
 ## Coding Conventions
 
 - Backend: Python type hints everywhere, async/await for I/O
