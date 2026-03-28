@@ -397,6 +397,240 @@ setMessageFeedback: (messageId: string, feedback: 1 | -1) =>
 | `frontend/src/hooks/useGraphStore.ts` | Add `setMessageFeedback` method |
 | `frontend/src/components/Chat/ChatPanel.tsx` | Add feedback buttons + submission handler |
 
+### Fix W1: Fixed 7 Clusters
+
+**Problem**: Louvain produces a variable number of clusters. With 365 nodes, it generates ~15 tiny named clusters + 1 massive "Other" with 271 nodes (74%). The "Other" blob dominates the visualization.
+
+**Solution**: Post-processing to guarantee exactly 7 clusters: keep the top 6 by size, merge everything else into "Other" (7th).
+
+**Modify**: `backend/app/graph_kb/knowledge_graph.py` → `detect_clusters()`
+
+After Louvain community detection and merging small communities:
+```python
+# Post-process: keep top 6 clusters by size, merge rest into "Other"
+MAX_CLUSTERS = 6  # +1 for "Other" = 7 total
+if len(main_communities) > MAX_CLUSTERS:
+    # Sort by size descending, keep top 6
+    main_communities_sorted = sorted(main_communities, key=len, reverse=True)
+    kept = main_communities_sorted[:MAX_CLUSTERS]
+    overflow = main_communities_sorted[MAX_CLUSTERS:]
+    # Move overflow communities into "Other"
+    for community in overflow:
+        other_nodes |= community
+    main_communities = kept
+```
+
+**Config**: Add `max_clusters: int = 7` to `config.py` (configurable via `MAX_CLUSTERS` env var).
+
+**Files**: `backend/app/graph_kb/knowledge_graph.py`, `backend/app/config.py`
+
+---
+
+### Fix W2: Feedback Comments + Learning from Corrections
+
+**Problem**: Thumbs up/down tells us IF a response was good, but not WHY or HOW to improve. The user might know the correct answer ("EquiHire is a startup, not an acqui-hire practice") but has no way to tell the agent. Future queries about the same topic will produce the same error.
+
+**Goal**: User can optionally type a text correction alongside thumbs down. That correction becomes part of the agent's knowledge — next time a similar question is asked, the correction is retrieved and injected into the context.
+
+#### Architecture: Corrections as ChromaDB Chunks
+
+```
+User clicks 👎 → types "EquiHire is a startup name, not acqui-hiring"
+     │
+     ▼
+POST /api/feedback/{user_id}
+  {rating: -1, comment: "EquiHire is a startup...", query: "What is EquiHire?"}
+     │
+     ├──→ Store in feedback.jsonl (existing, for analytics)
+     │
+     └──→ Embed comment → Store in ChromaDB as chunk_type: "user_correction"
+          metadata: {source_file: "user_feedback", chunk_type: "user_correction",
+                     original_query: "What is EquiHire?", rating: -1}
+     │
+     ▼
+Future query: "Tell me about EquiHire"
+     │
+     ├──→ RAG search finds correction chunk (high similarity to "EquiHire")
+     │
+     └──→ Context includes:
+          ## User Corrections
+          The user previously clarified: "EquiHire is a startup name, not acqui-hiring"
+          (in response to: "What is EquiHire?")
+```
+
+#### Implementation — 6 Steps
+
+**Step 1: Backend — Store corrections in ChromaDB**
+
+Modify `POST /api/feedback/{user_id}` in `routes.py`. When `comment` is provided, embed and store:
+
+```python
+@router.post("/feedback/{user_id}")
+async def submit_feedback(user_id: str, feedback: dict) -> dict:
+    _validate_user_id(user_id)
+    # 1. Store in JSONL (existing)
+    filepath = settings.data_dir / "users" / user_id / "feedback.jsonl"
+    with open(filepath, "a") as f:
+        f.write(json.dumps(feedback, ensure_ascii=False) + "\n")
+
+    # 2. If comment provided and rating is negative, store as correction chunk
+    comment = feedback.get("comment", "").strip()
+    if comment and feedback.get("rating", 0) < 0:
+        doc_store = get_document_store(user_id)
+        doc_store.ingest_summary(
+            content=f"User correction: {comment}",
+            metadata={
+                "source_file": "user_feedback",
+                "chunk_type": "user_correction",
+                "original_query": feedback.get("query", ""),
+                "timestamp": feedback.get("timestamp", ""),
+            }
+        )
+
+    return {"status": "ok"}
+```
+
+**Step 2: Prioritize corrections in RAG retrieval**
+
+Modify `retrieve_documents()` in `nodes.py`. After standard search, boost any correction chunks to the top:
+
+```python
+# After merging semantic + source chunks:
+merged.sort(key=lambda c: (
+    0 if c["metadata"].get("chunk_type") == "user_correction" else 1,
+    c.get("distance", 1),
+))
+```
+
+**Step 3: Label corrections distinctly in build_context**
+
+Modify `build_context()` in `nodes.py`. When assembling context, separate corrections from regular chunks:
+
+```python
+corrections = [c for c in chunks if c["metadata"].get("chunk_type") == "user_correction"]
+regular = [c for c in chunks if c["metadata"].get("chunk_type") != "user_correction"]
+
+if corrections:
+    doc_lines.append("## User Corrections (HIGHEST PRIORITY)\n")
+    for c in corrections:
+        original_q = c["metadata"].get("original_query", "")
+        doc_lines.append(f"**Correction** (in response to: \"{original_q}\"):")
+        doc_lines.append(c["content"])
+        doc_lines.append("")
+
+if regular:
+    doc_lines.append("## Relevant Document Excerpts\n")
+    for c in regular:
+        ...
+```
+
+**Step 4: System prompt — respect corrections**
+
+Add to Response Guidelines in SYSTEM_PROMPT:
+
+```
+- If "User Corrections" appear in the context, they have the HIGHEST PRIORITY.
+  A user correction overrides document excerpts and general knowledge. The user
+  has explicitly told you this is the correct information.
+```
+
+**Step 5: Frontend — Comment input on thumbs down**
+
+In `ChatPanel.tsx`, when user clicks 👎, show a text input:
+
+```tsx
+const [commentingId, setCommentingId] = useState<string | null>(null);
+const [commentText, setCommentText] = useState('');
+
+// On 👎 click:
+onClick={() => {
+    setCommentingId(message.id!);
+    // Don't submit yet — wait for optional comment
+}}
+
+// Show comment input when commentingId matches:
+{commentingId === message.id && (
+    <div style={{ display: 'flex', gap: '6px', marginTop: '4px', maxWidth: '85%' }}>
+        <input
+            type="text"
+            value={commentText}
+            onChange={(e) => setCommentText(e.target.value)}
+            placeholder="What was wrong? (optional)"
+            style={{ flex: 1, padding: '4px 8px', fontSize: '11px', borderRadius: '6px',
+                     border: '1px solid rgba(239,68,68,0.3)', background: 'rgba(239,68,68,0.05)',
+                     color: '#e6edf3', outline: 'none' }}
+            onKeyDown={(e) => { if (e.key === 'Enter') submitWithComment(); }}
+            autoFocus
+        />
+        <button onClick={submitWithComment} style={{ fontSize: '11px', padding: '4px 8px',
+            borderRadius: '6px', background: 'rgba(239,68,68,0.15)', border: '1px solid #ef4444',
+            color: '#ef4444', cursor: 'pointer' }}>
+            Send
+        </button>
+        <button onClick={() => { submitWithComment(); }} style={{ fontSize: '11px', padding: '4px 8px',
+            borderRadius: '6px', background: 'transparent', border: '1px solid #8b949e40',
+            color: '#8b949e', cursor: 'pointer' }}>
+            Skip
+        </button>
+    </div>
+)}
+```
+
+The `submitWithComment` function:
+```typescript
+const submitWithComment = () => {
+    handleFeedback(-1, commentText || undefined);
+    setCommentingId(null);
+    setCommentText('');
+};
+```
+
+**Step 6: Update handleFeedback to accept comment**
+
+```typescript
+const handleFeedback = async (rating: 1 | -1, comment?: string) => {
+    if (!message.id || message.feedback !== undefined) return;
+    const msgIndex = messages.findIndex(m => m.id === message.id);
+    const query = msgIndex > 0 ? messages[msgIndex - 1].content : '';
+    setMessageFeedback(message.id, rating);
+    await fetch('/api/feedback/default-user', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+            message_id: message.id, rating, query,
+            response: message.content, comment: comment || '',
+            timestamp: new Date().toISOString(),
+        }),
+    });
+};
+```
+
+#### Learning Flow Example
+
+```
+Turn 1:
+  User: "What is EquiHire?"
+  Agent: "EquiHire is an acqui-hire practice..."  ← WRONG
+  User: 👎 + comment: "EquiHire is a recruitment startup in the EU, not acqui-hiring"
+  → Correction stored in ChromaDB
+
+Turn 2 (next session):
+  User: "Tell me about EquiHire"
+  → RAG retrieves correction chunk (highest similarity)
+  → Context: "## User Corrections: EquiHire is a recruitment startup in the EU"
+  Agent: "EquiHire is a recruitment startup in the EU..."  ← CORRECTED
+```
+
+#### Files to Create/Modify
+
+| File | Change |
+|---|---|
+| `backend/app/graph_kb/knowledge_graph.py` | Fix cluster count to 7 (top 6 + Other) |
+| `backend/app/config.py` | Add `max_clusters: int = 7` |
+| `backend/app/api/routes.py` | Store correction in ChromaDB when comment + negative rating |
+| `backend/app/agent/nodes.py` | Prioritize corrections in retrieval + context, add system prompt instruction |
+| `frontend/src/components/Chat/ChatPanel.tsx` | Comment input on 👎, submit with text |
+
 ### Performance Optimizations (validated through stress testing)
 
 #### Stress Test Results (pre-optimization, 504 nodes, 1326 edges)

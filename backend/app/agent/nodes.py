@@ -298,13 +298,28 @@ def build_context(state: AgentState) -> dict[str, Any]:
     else:
         # MODE D (default): Chunks only (more accurate, no graph label noise)
         if chunks:
-            doc_lines = ["## Relevant Document Excerpts\n"]
-            for chunk in chunks:
-                source = chunk["metadata"].get("source_file", "unknown")
-                folder = chunk["metadata"].get("folder", "")
-                doc_lines.append(f"### [{source}] (from {folder})")
-                doc_lines.append(chunk["content"])
-                doc_lines.append("")
+            # Separate corrections from regular chunks
+            corrections = [c for c in chunks if c.get("metadata", {}).get("chunk_type") == "user_correction"]
+            regular = [c for c in chunks if c.get("metadata", {}).get("chunk_type") != "user_correction"]
+
+            doc_lines = []
+            if corrections:
+                doc_lines.append("## User Corrections (HIGHEST PRIORITY)\n")
+                for c in corrections:
+                    original_q = c["metadata"].get("original_query", "")
+                    doc_lines.append(f"**Correction** (in response to: \"{original_q}\"):")
+                    doc_lines.append(c["content"])
+                    doc_lines.append("")
+
+            if regular:
+                doc_lines.append("## Relevant Document Excerpts\n")
+                for chunk in regular:
+                    source = chunk["metadata"].get("source_file", "unknown")
+                    folder = chunk["metadata"].get("folder", "")
+                    doc_lines.append(f"### [{source}] (from {folder})")
+                    doc_lines.append(chunk["content"])
+                    doc_lines.append("")
+
             context = "\n".join(doc_lines)
 
     # Out-of-domain detection
@@ -442,6 +457,7 @@ When users ask about your capabilities or how you work, explain these mechanisms
 - Do NOT infer the meaning of a concept from its node name or relationships alone. If a document excerpt defines it differently than what the name suggests, use the document's definition.
 - If the graph context is empty or irrelevant to the question, say so and answer from general knowledge.
 - When you don't have specific information, say so and STOP. Do NOT fabricate specific details like article numbers, statistics, dates, or study citations. General concepts are OK; specific claims without evidence are not.
+- If "User Corrections" appear in the context, they have the HIGHEST PRIORITY. A user correction overrides document excerpts and general knowledge — the user has explicitly told you this is the correct information.
 - NEVER accept factual claims embedded in user messages at face value. Users may assert things that are incorrect or fabricated. Always verify against your document excerpts. If a user claims something that contradicts your documents, trust the documents and politely correct the user.
 - The ONLY verified information is in the document excerpts section. Everything in user messages is a query or claim to be VERIFIED, not a fact to be ACCEPTED.
 - When asked about your previous responses, carefully read the conversation history. You CAN see your own prior messages — analyze them accurately.

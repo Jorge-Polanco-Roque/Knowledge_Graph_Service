@@ -190,14 +190,36 @@ async def knowledge_gaps(user_id: str) -> dict[str, Any]:
 
 @router.post("/feedback/{user_id}")
 async def submit_feedback(user_id: str, feedback: dict[str, Any]) -> dict[str, str]:
-    """Store user feedback (thumbs up/down) for a response."""
+    """Store user feedback. If comment + negative rating, store as learning correction."""
     _validate_user_id(user_id)
     import json as _json
+    from ..graph_kb.document_store import get_document_store
+
+    # 1. Store in JSONL (analytics)
     feedback_dir = settings.data_dir / "users" / user_id
     feedback_dir.mkdir(parents=True, exist_ok=True)
     filepath = feedback_dir / "feedback.jsonl"
     with open(filepath, "a", encoding="utf-8") as f:
         f.write(_json.dumps(feedback, ensure_ascii=False) + "\n")
+
+    # 2. If comment provided with negative rating, store as correction chunk in ChromaDB
+    comment = feedback.get("comment", "").strip()
+    if comment and feedback.get("rating", 0) < 0:
+        try:
+            doc_store = get_document_store(user_id)
+            doc_store.ingest_summary(
+                summary=f"User correction: {comment}",
+                metadata={
+                    "source_file": "user_feedback",
+                    "chunk_type": "user_correction",
+                    "original_query": feedback.get("query", ""),
+                    "timestamp": feedback.get("timestamp", ""),
+                },
+            )
+            logger.info("Stored user correction for %s: %s", user_id, comment[:80])
+        except Exception as e:
+            logger.warning("Failed to store correction: %s", e)
+
     return {"status": "ok"}
 
 

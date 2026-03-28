@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     consolidation_threshold: float = 0.7
     spreading_factor: float = 0.5
 
+    # Clusters
+    max_clusters: int = 7
+
     # Query routing
     routing_model: str = "gpt-4o-mini"
 

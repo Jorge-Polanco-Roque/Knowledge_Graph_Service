@@ -9,6 +9,8 @@ from typing import Any
 
 import networkx as nx
 
+from ..config import settings
+
 from ..models.graph import (
     DiffAction,
     EdgeData,
@@ -176,6 +178,15 @@ class KnowledgeGraph:
                 main_communities.append(community)
             else:
                 other_nodes |= community
+
+        # Fix cluster count: keep top (max_clusters - 1), merge rest into "Other"
+        max_named = settings.max_clusters - 1  # Reserve 1 slot for "Other"
+        if len(main_communities) > max_named:
+            main_communities_sorted = sorted(main_communities, key=len, reverse=True)
+            kept = main_communities_sorted[:max_named]
+            for community in main_communities_sorted[max_named:]:
+                other_nodes |= community
+            main_communities = kept
 
         node_cluster_map: dict[str, int] = {}
         clusters = []
