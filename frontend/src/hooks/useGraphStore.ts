@@ -105,6 +105,18 @@ export const useGraphStore = create<GraphState>((set) => ({
       messages: [...state.messages, msg],
     })),
 
+  appendToLastMessage: (chunk: string) =>
+    set((state) => {
+      const msgs = [...state.messages];
+      const last = msgs[msgs.length - 1];
+      if (last && last.role === 'assistant') {
+        msgs[msgs.length - 1] = { ...last, content: last.content + chunk };
+      } else {
+        msgs.push({ role: 'assistant', content: chunk, timestamp: new Date().toISOString() });
+      }
+      return { messages: msgs, isLoading: false };
+    }),
+
   setConnected: (val: boolean) =>
     set({ isConnected: val }),
 

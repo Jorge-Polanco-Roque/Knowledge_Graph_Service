@@ -52,6 +52,8 @@ class WSMessageType(str, Enum):
     USER_MESSAGE = "user_message"
     # Server -> Client
     AGENT_RESPONSE = "agent_response"
+    RESPONSE_CHUNK = "response_chunk"
+    RESPONSE_END = "response_end"
     GRAPH_DIFF = "graph_diff"
     SPREADING_ACTIVATION = "spreading_activation"
     ERROR = "error"

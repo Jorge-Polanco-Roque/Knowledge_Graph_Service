@@ -249,6 +249,26 @@ def build_context(state: AgentState) -> dict[str, Any]:
             doc_lines.append("")
         context += "\n".join(doc_lines)
 
+    # Out-of-domain detection: check if activated nodes include pre-existing LTM knowledge
+    # STM nodes are ephemeral stubs; only LTM nodes represent established knowledge
+    has_established_knowledge = False
+    if activated_ids:
+        mm = _get_memory_manager(user_id)
+        for nid in activated_ids:
+            node = mm.graph.get_node(nid)
+            if node and node.memory_type.value == "ltm" and node.importance > 0.2:
+                has_established_knowledge = True
+                break
+    has_docs = bool(chunks)
+    if not has_established_knowledge and not has_docs:
+        disclaimer = (
+            "\n\n## IMPORTANT: No Relevant Knowledge Found\n\n"
+            "Your knowledge graph and document store do NOT contain substantial information "
+            "about this topic. You MUST tell the user: 'This topic is not in my knowledge base.' "
+            "Then you may answer from general knowledge, but clearly label it as such."
+        )
+        context += disclaimer
+
     return {"graph_context": context}
 
 

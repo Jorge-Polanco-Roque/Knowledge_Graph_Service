@@ -36,9 +36,42 @@ export function useWebSocket(userId: string) {
         const { type, data } = msg;
 
         switch (type) {
-          case 'agent_response': {
-            // Snapshot activated concepts at response time so tags are static per message
+          case 'response_chunk':
+            // Stream token: append to last assistant message (or create one)
+            store.getState().appendToLastMessage(data.content);
+            break;
+
+          case 'response_end': {
+            // Streaming complete: finalize message with concepts, apply diff
             const concepts = (data.extracted_concepts || []).map((c: any) => ({
+              id: c.label?.toLowerCase().replace(/\s+/g, '_') || '',
+              label: c.label || '',
+              category: c.category || 'concept',
+            }));
+            // Update last message with concepts
+            const msgs = store.getState().messages;
+            if (msgs.length > 0) {
+              const last = msgs[msgs.length - 1];
+              if (last.role === 'assistant') {
+                store.setState({
+                  messages: [...msgs.slice(0, -1), { ...last, concepts }],
+                });
+              }
+            }
+            store.getState().setLoading(false);
+            if (data.graph_diff) {
+              store.getState().applyDiff(data.graph_diff);
+            }
+            fetch(`/api/graph/${userId}/stats`)
+              .then((r) => r.ok ? r.json() : null)
+              .then((stats) => { if (stats) store.getState().setStats(stats); })
+              .catch(() => {});
+            break;
+          }
+
+          // Legacy: non-streaming agent_response (REST API compatibility)
+          case 'agent_response': {
+            const conceptsLegacy = (data.extracted_concepts || []).map((c: any) => ({
               id: c.label?.toLowerCase().replace(/\s+/g, '_') || '',
               label: c.label || '',
               category: c.category || 'concept',
@@ -47,17 +80,12 @@ export function useWebSocket(userId: string) {
               role: 'assistant',
               content: data.content,
               timestamp: new Date().toISOString(),
-              concepts,
+              concepts: conceptsLegacy,
             });
             store.getState().setLoading(false);
             if (data.graph_diff) {
               store.getState().applyDiff(data.graph_diff);
             }
-            // Auto-refresh stats after agent response
-            fetch(`/api/graph/${userId}/stats`)
-              .then((r) => r.ok ? r.json() : null)
-              .then((stats) => { if (stats) store.getState().setStats(stats); })
-              .catch(() => {});
             break;
           }
 

@@ -145,17 +145,38 @@ async def deduplicate_graph(user_id: str, threshold: float = 0.85) -> dict[str, 
 
 @router.delete("/graph/{user_id}")
 async def reset_graph(user_id: str) -> dict[str, str]:
-    """Reset a user's knowledge graph (delete all data)."""
+    """Full reset: clear knowledge graph, ChromaDB chunks, and embedding cache."""
     try:
-        mm = _get_memory_manager(user_id)
-        # Clear the graph file by saving an empty graph
         from ..graph_kb.knowledge_graph import KnowledgeGraph
 
+        # 1. Reset NetworkX graph
+        mm = _get_memory_manager(user_id)
         mm.graph = KnowledgeGraph()
         mm.save()
-        # Remove cached manager so a fresh one is created next time
         reset_memory_manager(user_id)
-        return {"status": "ok", "message": f"Graph for user '{user_id}' has been reset."}
+
+        # 2. Clear ChromaDB chunks
+        try:
+            from ..graph_kb.document_store import get_document_store, _document_stores
+            doc_store = get_document_store(user_id)
+            # Delete all documents in the collection
+            if doc_store._collection.count() > 0:
+                doc_store._collection.delete(where={"source_file": {"$ne": ""}})
+            _document_stores.pop(user_id, None)
+        except Exception as e:
+            logger.warning("Failed to clear ChromaDB for %s: %s", user_id, e)
+
+        # 3. Delete embedding cache
+        try:
+            cache_path = settings.data_dir / "users" / user_id / "node_embeddings.npz"
+            if cache_path.exists():
+                cache_path.unlink()
+            from ..graph_kb.embedding_cache import _caches
+            _caches.pop(user_id, None)
+        except Exception as e:
+            logger.warning("Failed to clear embedding cache for %s: %s", user_id, e)
+
+        return {"status": "ok", "message": f"Full reset for '{user_id}': graph, ChromaDB, and embedding cache cleared."}
     except Exception as exc:
         logger.error("Error resetting graph for %s: %s", user_id, exc, exc_info=True)
         raise HTTPException(status_code=500, detail=str(exc))

@@ -220,6 +220,328 @@ def prune_ghost_nodes(self, min_importance: float = 0.3) -> int:
 | `backend/app/api/routes.py` | D | `POST /api/graph/{user_id}/prune-ghosts` endpoint |
 | `backend/app/config.py` | A,C | `max_context_concepts`, `max_context_relationships`, `max_edges_per_node` |
 
+### Short-Term Improvements (3 Plans)
+
+#### Plan E: Clean Re-ingestion Pipeline
+
+##### Problem
+
+The current graph data was ingested BEFORE several critical fixes were implemented: cross-linking (`source_files` in metadata), relationship validation (fallback to `related_to`), fuzzy concept matching, and RAG chunking. As a result:
+- 0 nodes have `source_files` metadata → cross-linking is inactive
+- RAG chunks were stored without performance fixes → retrieval is suboptimal
+- Graph may contain invalid relationship types from earlier runs
+- Ghost nodes and duplicates accumulated pre-dedup
+
+The `DELETE /api/graph/{user_id}` endpoint resets the NetworkX graph but does NOT clear ChromaDB or the embedding cache, leaving orphaned data.
+
+##### Solution: Full Reset Endpoint + Re-ingestion
+
+**Step 1: Extend reset endpoint to clear ALL data stores**
+
+Modify `DELETE /api/graph/{user_id}` in `backend/app/api/routes.py`:
+
+```python
+@router.delete("/graph/{user_id}")
+async def reset_graph(user_id: str) -> dict:
+    # 1. Reset NetworkX graph
+    mm = _get_memory_manager(user_id)
+    mm.graph = KnowledgeGraph()
+    mm.save()
+    reset_memory_manager(user_id)
+
+    # 2. Clear ChromaDB chunks
+    try:
+        from ..graph_kb.document_store import get_document_store, _document_stores
+        doc_store = get_document_store(user_id)
+        doc_store._collection.delete(where={})  # Delete all chunks
+        _document_stores.pop(user_id, None)
+    except Exception:
+        pass
+
+    # 3. Delete embedding cache
+    cache_path = settings.data_dir / "users" / user_id / "node_embeddings.npz"
+    cache_path.unlink(missing_ok=True)
+    from ..graph_kb.embedding_cache import _caches
+    _caches.pop(user_id, None)
+
+    return {"status": "ok", "message": "Full reset: graph, ChromaDB, and embedding cache cleared."}
+```
+
+**Step 2: Re-ingest procedure**
+
+After reset, call `POST /api/ingest/{user_id}` which will:
+1. Read all files from `inputs/`
+2. For each file: chunk + embed in ChromaDB (RAG) ← now with all fixes
+3. Extract concepts via LLM → create nodes + edges ← with relationship validation
+4. Store `source_files` in each node's metadata ← cross-linking active
+5. Apply plasticity, consolidation
+6. Save graph
+
+**Step 3: Post-ingestion cleanup**
+
+After re-ingestion, run in sequence:
+```bash
+POST /api/graph/{user_id}/deduplicate     # Merge quasi-duplicate nodes
+POST /api/graph/{user_id}/prune-ghosts    # Remove disconnected low-importance nodes
+POST /api/graph/{user_id}/summarize-clusters  # Generate cluster descriptions
+```
+
+##### Files to Modify
+
+| File | Change |
+|---|---|
+| `backend/app/api/routes.py` | Extend `DELETE /api/graph/{user_id}` to clear ChromaDB + embedding cache |
+
+---
+
+#### Plan F: Out-of-Domain Detection
+
+##### Problem
+
+When the user asks "¿Cuál es la receta de la paella valenciana?", the agent answers from general knowledge WITHOUT clarifying that this information is NOT in its knowledge graph. The user can't distinguish graph-grounded answers from general knowledge, which undermines trust in the system.
+
+Stress test result: Q4 was rated "PARTIAL" because the agent gave a correct answer but didn't disclose its source.
+
+##### Solution: Context-Aware Disclaimers
+
+Inject a transparency signal into the graph context when the knowledge graph has no relevant information. This is deterministic (no extra LLM call) — just a check in `build_context`.
+
+**Modify**: `backend/app/agent/nodes.py` → `build_context()`
+
+```python
+def build_context(state):
+    # ... existing code to build graph_context and document chunks ...
+
+    # If BOTH graph context and document chunks are empty/minimal,
+    # inject a disclaimer that tells the LLM to be transparent
+    has_graph = bool(context.strip())
+    has_docs = bool(chunks)
+
+    if not has_graph and not has_docs:
+        context = (
+            "## No Relevant Knowledge Found\n\n"
+            "Your knowledge graph and document store do NOT contain information "
+            "related to this query. You MUST explicitly tell the user: "
+            "'This topic is not in my knowledge base. Based on my general knowledge:' "
+            "before answering. Do NOT present general knowledge as if it came from the graph."
+        )
+
+    return {"graph_context": context}
+```
+
+**Why this works**: The LLM already follows the system prompt's instruction to "ground responses in the Knowledge Graph Context." When the context says "no relevant knowledge found," the LLM will naturally disclaim its source. The explicit instruction reinforces this.
+
+**Edge cases**:
+- Graph has concepts but no documents → still has some grounding, no disclaimer
+- Graph has documents but no concepts → still has evidence, no disclaimer
+- Both empty → disclaimer injected
+- Query partially in-domain (e.g., "fairness in cooking") → some concepts activate, no disclaimer. The graph context steers the answer appropriately.
+
+##### Files to Modify
+
+| File | Change |
+|---|---|
+| `backend/app/agent/nodes.py` | Add empty-context check in `build_context()` |
+
+---
+
+#### Plan G: Streaming Responses
+
+##### Problem
+
+The user sends a message and waits 5-10 seconds with no feedback (only the "Processing neural pathways..." loading dots). The entire response appears at once. This makes the tool feel slow even when the actual generation is fast — the perception of speed matters as much as actual speed.
+
+Modern chat interfaces (ChatGPT, Claude) stream tokens as they arrive. Users expect this behavior.
+
+##### Solution: Token-Level WebSocket Streaming
+
+Break the agent pipeline into two phases:
+1. **Pre-generation** (sync, ~1-2s): extract_concepts → activate_memory → retrieve_documents → build_context
+2. **Generation** (streaming, ~3-8s): Stream LLM tokens via WebSocket as they arrive
+
+The user sees the first token after ~1-2s instead of the full response after ~5-10s.
+
+##### Architecture
+
+```
+Current:
+  User msg → [===== 5-10s entire pipeline =====] → Full response
+
+Streaming:
+  User msg → [1-2s pre-gen] → [token][token][token]...[done] → Graph diff
+                                 ↑ User starts reading here
+```
+
+##### New WebSocket Message Types
+
+Add to `WSMessageType` enum:
+```python
+RESPONSE_CHUNK = "response_chunk"   # {"content": "partial token..."}
+RESPONSE_END = "response_end"       # Signals streaming is complete
+```
+
+##### Implementation — 3 Files
+
+**File 1: `backend/app/api/websocket.py` — Streaming pipeline**
+
+Replace `_run_agent()` with a streaming version that calls pipeline nodes directly:
+
+```python
+async def _run_agent_streaming(user_id, messages, websocket):
+    """Run agent pipeline with token-level streaming for the generation step."""
+    import asyncio
+    from ..agent.nodes import (
+        extract_concepts, activate_memory, retrieve_documents,
+        build_context, update_graph, SYSTEM_PROMPT, _get_memory_manager,
+    )
+
+    state = {"messages": messages, "user_id": user_id}
+    loop = asyncio.get_event_loop()
+
+    # Phase 1: Pre-generation (sync functions run in executor)
+    state.update(await loop.run_in_executor(None, extract_concepts, state))
+    state.update(await loop.run_in_executor(None, activate_memory, state))
+    state.update(await loop.run_in_executor(None, retrieve_documents, state))
+    state.update(await loop.run_in_executor(None, build_context, state))
+
+    # Phase 2: Stream LLM response
+    graph_context = state.get("graph_context", "")
+    system = SYSTEM_PROMPT.format(
+        graph_context=graph_context if graph_context else "No relevant context yet."
+    )
+    llm_messages = [{"role": "system", "content": system}]
+    for msg in messages:
+        llm_messages.append({"role": msg.role.value, "content": msg.content})
+
+    llm = ChatOpenAI(
+        model=settings.openai_model,
+        api_key=settings.openai_api_key,
+        temperature=0.3,
+        streaming=True,
+    )
+
+    full_response = ""
+    async for chunk in llm.astream(llm_messages):
+        if chunk.content:
+            full_response += chunk.content
+            await websocket.send_json({
+                "type": "response_chunk",
+                "data": {"content": chunk.content},
+            })
+
+    state["response"] = full_response
+
+    # Phase 3: Update graph + send final messages
+    state.update(await loop.run_in_executor(None, update_graph, state))
+
+    return state
+```
+
+Then in the WebSocket handler, replace:
+```python
+result = await _run_agent(user_id, list(conversation))
+```
+with:
+```python
+result = await _run_agent_streaming(user_id, list(conversation), websocket)
+```
+
+And after streaming completes, send `response_end` + `graph_diff` + `spreading_activation` as before, but the `agent_response` message only carries concepts and diff (content was already streamed).
+
+**File 2: `frontend/src/hooks/useGraphStore.ts` — Streaming store method**
+
+Add a method to append content to the last assistant message:
+
+```typescript
+appendToLastMessage: (chunk: string) =>
+    set((state) => {
+        const msgs = [...state.messages];
+        const last = msgs[msgs.length - 1];
+        if (last && last.role === 'assistant') {
+            msgs[msgs.length - 1] = { ...last, content: last.content + chunk };
+        } else {
+            msgs.push({
+                role: 'assistant',
+                content: chunk,
+                timestamp: new Date().toISOString(),
+            });
+        }
+        return { messages: msgs };
+    }),
+```
+
+**File 3: `frontend/src/hooks/useWebSocket.ts` — Handle streaming messages**
+
+Add cases for the new message types:
+
+```typescript
+case 'response_chunk':
+    store.getState().appendToLastMessage(data.content);
+    break;
+
+case 'response_end':
+    // Finalize: update last message with concepts, stop loading
+    store.getState().setLoading(false);
+    if (data.graph_diff) {
+        store.getState().applyDiff(data.graph_diff);
+    }
+    // Update last message concepts
+    const concepts = (data.extracted_concepts || []).map(c => ({
+        id: c.label?.toLowerCase().replace(/\s+/g, '_') || '',
+        label: c.label || '',
+        category: c.category || 'concept',
+    }));
+    const msgs = store.getState().messages;
+    if (msgs.length > 0) {
+        const last = msgs[msgs.length - 1];
+        store.setState({
+            messages: [...msgs.slice(0, -1), { ...last, concepts }],
+        });
+    }
+    break;
+```
+
+##### UX Timeline (After Implementation)
+
+```
+t=0.0s  User sends "Explain fairness in hiring"
+t=0.0s  Loading dots appear
+t=1.5s  Pre-generation complete (extract, activate, retrieve, build_context)
+t=1.5s  Loading dots disappear, first token appears: "Fairness"
+t=1.6s  " in"
+t=1.7s  " hiring"
+t=1.8s  " refers to..."
+  ...   (tokens stream in real-time)
+t=6.0s  Response complete. Graph diff applied. Nodes glow.
+```
+
+The user starts reading at 1.5s instead of waiting until 6.0s. Perceived latency drops by ~70%.
+
+##### Backward Compatibility
+
+- The REST endpoint `POST /api/chat` remains non-streaming (for programmatic clients)
+- Only the WebSocket path streams
+- If WebSocket disconnects mid-stream, the graph update still completes server-side
+- The `agent_response` message type is kept for the final summary (concepts, diff)
+
+##### Files to Modify
+
+| File | Change |
+|---|---|
+| `backend/app/models/messages.py` | Add `RESPONSE_CHUNK`, `RESPONSE_END` to `WSMessageType` |
+| `backend/app/api/websocket.py` | Replace `_run_agent` with `_run_agent_streaming` |
+| `frontend/src/hooks/useGraphStore.ts` | Add `appendToLastMessage` method |
+| `frontend/src/hooks/useWebSocket.ts` | Handle `response_chunk` and `response_end` |
+
+##### Performance Impact
+
+| Metric | Before | After |
+|---|---|---|
+| Time to first token | 5-10s | ~1.5s |
+| Total response time | 5-10s | 5-10s (same) |
+| Perceived latency | High (blank screen) | Low (streaming text) |
+| WebSocket messages per response | 3 | 30-100+ (1 per token) |
+
 ### Cross-Linking: Graph ↔ Documents
 
 #### Problem
