@@ -39,6 +39,10 @@ The application features a split-view interface: a **3D interactive brain visual
 - **Markdown Chat** — AI responses rendered with full Markdown support (bold, italic, lists, code blocks, headings)
 - **RAG (Retrieval-Augmented Generation)** — Document chunks stored in ChromaDB with OpenAI embeddings. Dual retrieval strategy: semantic search + graph-guided search (finds chunks from documents linked to activated graph nodes). Agent cites specific document excerpts
 - **Graph ↔ Document Cross-Linking** — Every node tracks which documents it was extracted from (`source_files` metadata). Hover a node to see its source documents. Enables bidirectional navigation between structured knowledge and raw evidence
+- **Contextual Spreading Activation** — Query-weighted neural propagation. Node embeddings cached in `.npz`; cosine similarity between query and neighbors modulates which pathways activate, focusing context on what matters for each question
+- **Semantic Deduplication** — Embedding-based cosine similarity detects and merges quasi-duplicate nodes (e.g., "AI Fairness" + "Fairness in AI"), cleaning the graph and consolidating knowledge
+- **Cluster Summaries** — LLM-generated 2-3 sentence descriptions per cluster, using top nodes + relationships + document excerpts
+- **Response Visualization** — Activated nodes glow in the 3D graph when the agent responds; camera flies to the activation region; fades after 8 seconds
 - **Intelligent Agent** — Critical thinking system prompt that challenges false premises, grounds responses in graph knowledge via fuzzy concept matching, and validates relationship types
 - **AI-Powered Concept Extraction** — GPT-4o extracts entities, relationships, and semantic meaning from natural conversation
 - **File Ingestion** — Ingest documents (.docx, .pdf, .xlsx, .pptx, .csv, .json, .txt, .md), code files, and images (via GPT-4o vision) to bootstrap your knowledge graph

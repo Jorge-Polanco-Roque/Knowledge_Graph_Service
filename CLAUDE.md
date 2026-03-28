@@ -65,10 +65,13 @@ backend/ (Python + FastAPI)
 - **Ports**: Backend=8899, Frontend=3477
 
 ### Agent Intelligence (validated through iteration)
-- **System prompt**: Instructs the LLM to think critically, challenge false premises, distinguish known from unknown, and ground responses in graph context.
+- **System prompt**: Instructs the LLM to think critically, challenge false premises, distinguish known from unknown, and ground responses in graph context. Includes citation guidelines for document excerpts.
 - **Fuzzy concept matching**: When the user mentions a concept, `_find_related_nodes()` searches all existing graph nodes by substring and word overlap (not just exact ID match). This ensures the agent uses existing knowledge instead of creating empty stubs.
 - **Relationship validation**: LLM-extracted relationship types are validated against the `RelationshipType` enum; invalid values fallback to `related_to` to prevent Pydantic crashes.
-- **Spreading activation**: Depth=2, min_activation=0.05, factor=0.5. Context built from activated subgraph includes concepts + relationships for the LLM prompt.
+- **Contextual spreading activation**: Query-weighted propagation. `NodeEmbeddingCache` pre-computes embeddings for all node labels (persisted as `.npz`). At query time, cosine similarity between query and each neighbor modulates the spreading: `context_factor = 0.3 + 0.7 × similarity`. Relevant pathways get stronger activation, irrelevant ones get dampened. Cache auto-rebuilds when nodes change. Overhead: ~200ms per query (one embedding API call).
+- **Semantic deduplication**: `NodeDeduplicator` embeds all node labels, computes cosine similarity matrix, merges nodes above threshold (default 0.85). Union-Find groups duplicates, primary node (highest importance) absorbs metadata/edges/source_files. Endpoint: `POST /api/graph/{user_id}/deduplicate`.
+- **Cluster summaries**: LLM-generated 2-3 sentence descriptions per cluster. Uses top 10 nodes + relationships + sample document chunks. Endpoint: `POST /api/graph/{user_id}/summarize-clusters`. Summary shown in cluster legend tooltip.
+- **Response visualization**: Activated nodes glow with `createActivatedPillTexture` (brighter fill, white border, outer glow). Camera flies to activation region. Auto-clears after 8 seconds. Uses existing `activatedNodes` from WebSocket `GraphDiff`.
 
 ### Cross-Linking: Graph ↔ Documents
 
