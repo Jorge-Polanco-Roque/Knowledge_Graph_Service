@@ -186,27 +186,39 @@ def prune_ghost_nodes(self, min_importance: float = 0.3) -> int:
 
 **Expected impact**: Removes ~100-150 nodes. Embedding cache shrinks 30%. 3D visualization is cleaner. Cluster detection is more accurate.
 
-#### Combined Expected Impact
+#### Actual Results (post-implementation, 442 nodes)
 
-| Metric | Before | After |
-|---|---|---|
-| Context tokens | ~18,480 | ~2,000 |
-| API calls/query | 6 | 3-4 |
-| Complex query latency | 11.3s | ~3-4s |
-| Graph nodes | 504 | ~350 (after ghost pruning) |
-| Cache rebuilds | Every query | Only after ingestion/dedup |
-| Hub traversal | 324 edges | Max 30 edges |
+| Metric | Before | After | Improvement |
+|---|---|---|---|
+| Context tokens | ~18,480 | ~1,206 | 93% reduction |
+| Complex query (warm cache) | 11.3s | 5.4-6.6s | 42-52% faster |
+| API calls/query | 6 | 3-4 | Cache no longer rebuilds per query |
+| Graph nodes | 504 | 442 | 63 ghost nodes pruned |
+| Hub traversal | 324 edges | Max 30 | Spreading stays bounded |
 
-#### Files to Modify
+#### Intelligence Quality (post-optimization stress test)
+
+| Test | Result |
+|---|---|
+| False premise detection ("mangas del chaleco") | **PASS** — correctly identifies vests have no sleeves |
+| Graph-grounded response (EU AI Act + fairness metrics) | **PASS** — connects concepts, 12 nodes activated |
+| Multi-hop reasoning (hiring + Audit Playbook + regulation) | **PASS** — structured steps linking ML, hiring, AI Act |
+| Out-of-domain (paella recipe) | **PARTIAL** — answers but doesn't clarify it's not in the graph |
+| RAG citation (bias amplification article) | **NEEDS RE-INGESTION** — chunks stored before fixes |
+| Synthesis (individual vs group fairness for banking) | **PASS** — structured comparison, 11 nodes activated |
+
+**Known issues**: Out-of-domain questions should explicitly distinguish graph knowledge from general knowledge. RAG citations require re-ingestion after performance fixes.
+
+#### Files Modified
 
 | File | Fix | Change |
 |---|---|---|
 | `backend/app/graph_kb/memory.py` | A | Cap context to 20 concepts + 30 relationships |
 | `backend/app/graph_kb/embedding_cache.py` | B | Version hash from LTM nodes only |
 | `backend/app/graph_kb/spreading.py` | C | Limit edges per node to 30 during traversal |
-| `backend/app/graph_kb/knowledge_graph.py` | D | Add `prune_ghost_nodes()` method |
-| `backend/app/api/routes.py` | D | Add `POST /api/graph/{user_id}/prune-ghosts` endpoint |
-| `backend/app/config.py` | A,C | Add `max_context_concepts`, `max_context_relationships`, `max_edges_per_node` settings |
+| `backend/app/graph_kb/knowledge_graph.py` | D | `prune_ghost_nodes()` method |
+| `backend/app/api/routes.py` | D | `POST /api/graph/{user_id}/prune-ghosts` endpoint |
+| `backend/app/config.py` | A,C | `max_context_concepts`, `max_context_relationships`, `max_edges_per_node` |
 
 ### Cross-Linking: Graph ↔ Documents
 
