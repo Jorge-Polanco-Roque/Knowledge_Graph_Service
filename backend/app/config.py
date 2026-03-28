@@ -32,7 +32,7 @@ class Settings(BaseSettings):
     spreading_factor: float = 0.5
 
     # Clusters
-    max_clusters: int = 7
+    max_clusters: int = 10
 
     # Query routing
     routing_model: str = "gpt-4o-mini"
