@@ -81,6 +81,14 @@ backend/ (Python + FastAPI)
   - `"chunks_only"` **(default, Mode D)**: Only RAG document chunks (top 7). More accurate, no graph label noise. A/B/C/D testing showed this mode wins on factual precision (EquiHire correctly identified as "startup" not "acqui-hire"), same latency, 30% less tokens.
   - `"graph_and_chunks"` **(Mode A)**: Graph context (spreading activation, 20 concepts + 30 relationships) + RAG chunks. Richer connections but may infer wrong meanings from node labels. Reactivate by setting `CONTEXT_MODE=graph_and_chunks` in `.env`.
   - The graph is still used in both modes for: 3D visualization, spreading activation, fuzzy matching, graph-guided RAG retrieval, deduplication, clustering. Only the LLM prompt context changes.
+- **Query routing**: `classify_query()` uses GPT-4o-mini to route queries as `greeting` (skip pipeline), `simple` (RAG only), or `complex` (full pipeline). 10/10 accuracy in testing. Greetings respond in ~2s vs 6-8s for full queries.
+- **Language-aware responses**: `_detect_language()` detects query language (es, en, zh, ar, fr, pt, de) and injects response language instruction. 10/10 accuracy in testing.
+- **Document comparison**: `_detect_document_refs()` detects "article_1 vs article_3" patterns in queries and searches within each referenced document separately for targeted comparison.
+- **Knowledge gap detection**: `detect_knowledge_gaps()` finds nodes without document evidence. Endpoint: `GET /api/graph/{user_id}/gaps`. Reports per-node and per-cluster coverage.
+- **User feedback**: `POST /api/feedback/{user_id}` stores thumbs up/down as JSONL. `GET /api/feedback/{user_id}/summary` for analytics.
+- **Graph timeline**: `save_snapshot()` records timestamped graph state after ingestion events. `GET /api/graph/{user_id}/timeline` lists snapshots.
+- **Node confidence visualization**: `computeConfidence()` in frontend uses source_files count + activation_count. Low confidence nodes render semi-transparent. Distribution: 145 nodes at 0.3-0.6, 167 at 0.8-1.0.
+- **Semantic chunking**: Paragraph-aware splitting (800 chars, 150 overlap, 7-level separators: section/paragraph/line/sentence/question/exclamation/word). Still 39% of chunks end mid-sentence due to DOCX formatting — a known limitation.
 
 ### Clean Re-ingestion Results
 

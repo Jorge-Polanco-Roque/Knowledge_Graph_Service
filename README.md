@@ -46,13 +46,20 @@ The application features a split-view interface: a **3D interactive brain visual
 - **Grounding & Anti-Hallucination** — Post-processing grounding check verifies specific claims (article numbers, statistics, citations) against the context. Self-hallucination loop prevention: conversation files excluded from RAG to prevent the agent from citing its own previous hallucinations as evidence. Documents are the primary source of truth over graph inferences
 - **Streaming Responses** — Token-level WebSocket streaming. Pre-generation pipeline runs first (~1.5s), then LLM tokens stream in real-time. Time-to-first-token drops from 5-10s to ~1.5s
 - **Security** — Prompt injection defense (immutable identity, injection pattern detection), concept sanitization (blocklist for sensitive terms), user ID validation (regex, prevents path traversal)
+- **Query Routing** — Adaptive pipeline: GPT-4o-mini classifies queries as greeting/simple/complex, skipping unnecessary pipeline stages. 10/10 accuracy, greetings respond in ~2s vs 6-8s for full queries
+- **Language-Aware** — Detects query language (Spanish, English, Chinese, Arabic, French, Portuguese, German) and responds in the same language
+- **Document Comparison** — Detects "article_1 vs article_3" references and searches within each document separately for targeted comparison
+- **Knowledge Gap Detection** — Identifies concepts without document evidence. Reports per-node and per-cluster coverage gaps
+- **Node Confidence Visualization** — Low-confidence nodes (few sources, low activation) render semi-transparent in the 3D graph
+- **User Feedback** — Thumbs up/down per response, stored as JSONL with analytics summary endpoint
+- **Graph Timeline** — Timestamped snapshots on ingestion events for tracking knowledge evolution
 - **Intelligent Agent** — Critical thinking system prompt that challenges false premises, grounds responses in graph knowledge via fuzzy concept matching, and validates relationship types
 - **AI-Powered Concept Extraction** — GPT-4o extracts entities, relationships, and semantic meaning from natural conversation
-- **File Ingestion** — Ingest documents (.docx, .pdf, .xlsx, .pptx, .csv, .json, .txt, .md), code files, and images (via GPT-4o vision) to bootstrap your knowledge graph
+- **File Ingestion** — Ingest documents (.docx, .pdf, .xlsx, .pptx, .csv, .json, .txt, .md), code files, and images (via GPT-4o vision) with auto-generated document summaries
 - **Real-Time Updates** — WebSocket-driven graph diffs push changes instantly to the frontend
 - **Light & Dark Themes** — Full theme support with neural-inspired color palettes
-- **Performance Optimizations** — Stress-tested and validated: context capped at 20 concepts + 30 relationships (93% token reduction), hub edge limiting (max 30/node), smart embedding cache (LTM-only versioning), ghost node pruning. Query latency: 11.3s → 5.4s with no intelligence degradation
-- **Per-User Graphs** — Each user gets an isolated, persistent knowledge graph
+- **Performance Optimizations** — Stress-tested: context capped (93% token reduction), hub edge limiting (30/node), smart embedding cache, ghost node pruning. Query latency: 11.3s → 5.4s. Cost: ~$0.019/query
+- **Per-User Graphs** — Each user gets an isolated, persistent knowledge graph with feedback history and timeline
 
 ## Architecture
 
