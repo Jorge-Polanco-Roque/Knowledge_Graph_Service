@@ -470,6 +470,18 @@ def ingest_all_files(inputs_dir: Path, user_id: str) -> dict[str, Any]:
 
     final_snapshot = mm.get_full_snapshot()
 
+    # Save timeline snapshot after ingestion
+    try:
+        from ..graph_kb.timeline import save_snapshot
+        save_snapshot(user_id, "ingestion", {
+            "files": len(results),
+            "concepts": total_concepts,
+            "nodes": mm.graph.node_count,
+            "edges": mm.graph.edge_count,
+        })
+    except Exception as e:
+        logger.warning("Timeline snapshot failed: %s", e)
+
     return {
         "status": "completed",
         "files_processed": len(results),

@@ -17,6 +17,38 @@ from .state import AgentState
 
 logger = logging.getLogger(__name__)
 
+
+# ------------------------------------------------------------------
+# Query routing
+# ------------------------------------------------------------------
+
+_ROUTING_PROMPT = """Classify this user message into one category:
+- "greeting" if it's a greeting, thanks, acknowledgment, or casual chat
+- "simple" if it asks about one concept or needs a direct factual answer
+- "complex" if it compares concepts, asks for analysis, or requires synthesizing multiple sources
+
+Message: {message}
+
+Reply with ONLY one word: greeting, simple, or complex."""
+
+
+def classify_query(message: str) -> str:
+    """Classify a query to determine which pipeline route to use."""
+    try:
+        llm = ChatOpenAI(
+            model=settings.routing_model,
+            api_key=settings.openai_api_key,
+            temperature=0,
+            max_tokens=10,
+        )
+        response = llm.invoke([{"role": "user", "content": _ROUTING_PROMPT.format(message=message)}])
+        route = response.content.strip().lower().rstrip(".")
+        if route in ("greeting", "simple", "complex"):
+            return route
+    except Exception as exc:
+        logger.warning("Query routing failed: %s", exc)
+    return "simple"
+
 # Cache MemoryManager instances per user to avoid reloading from disk every turn
 _memory_managers: dict[str, MemoryManager] = {}
 
@@ -184,6 +216,20 @@ def retrieve_documents(state: AgentState) -> dict[str, Any]:
     try:
         doc_store = get_document_store(user_id)
 
+        # Document comparison: detect file references in query
+        doc_refs = _detect_document_refs(query)
+        if len(doc_refs) >= 2:
+            # Comparison mode: search within each referenced document
+            comparison_chunks: list[dict] = []
+            all_sources = doc_store.list_source_files()
+            for ref in doc_refs:
+                matching = [s for s in all_sources if ref.lower() in s.lower()]
+                for source in matching[:2]:
+                    ref_chunks = doc_store.search(query, top_k=3, where={"source_file": source})
+                    comparison_chunks.extend(ref_chunks)
+            if comparison_chunks:
+                return {"document_chunks": comparison_chunks[:settings.rag_top_k]}
+
         # Strategy 1: Pure semantic search
         semantic_chunks = doc_store.search(query, top_k=3)
 
@@ -282,7 +328,51 @@ def build_context(state: AgentState) -> dict[str, Any]:
         )
         context += disclaimer
 
+    # Language-aware: detect query language and instruct LLM to match
+    if query:
+        lang = _detect_language(query)
+        lang_instructions = {
+            "es": "\n\n## Language\nResponde completamente en español.",
+            "pt": "\n\n## Language\nResponda completamente em português.",
+            "fr": "\n\n## Language\nRépondez entièrement en français.",
+            "de": "\n\n## Language\nAntworten Sie vollständig auf Deutsch.",
+            "zh": "\n\n## Language\n请用中文回答。",
+            "ar": "\n\n## Language\nأجب بالعربية بالكامل.",
+        }
+        if lang in lang_instructions:
+            context += lang_instructions[lang]
+
     return {"graph_context": context}
+
+
+def _detect_document_refs(query: str) -> list[str]:
+    """Extract document references from a user query (e.g., 'article_1', 'article 3')."""
+    refs = []
+    for match in _re.finditer(r'article[_\s]?(\d+)', query, _re.IGNORECASE):
+        refs.append(f"article_{match.group(1)}")
+    return list(set(refs))
+
+
+def _detect_language(text: str) -> str:
+    """Simple heuristic language detection."""
+    sample = text[:200].lower()
+    # Spanish
+    if any(w in sample for w in ["qué", "cómo", "cuál", "dónde", "por qué", "explica",
+                                   "dime", "está", "también", "además", "según"]):
+        return "es"
+    # Portuguese
+    if any(w in sample for w in ["como", "onde", "porque", "também", "além"]):
+        return "pt"
+    # French
+    if any(w in sample for w in ["qu'est", "comment", "pourquoi", "aussi", "quel"]):
+        return "fr"
+    # Chinese
+    if any('\u4e00' <= c <= '\u9fff' for c in sample):
+        return "zh"
+    # Arabic
+    if any('\u0600' <= c <= '\u06ff' for c in sample):
+        return "ar"
+    return "en"
 
 
 # ------------------------------------------------------------------

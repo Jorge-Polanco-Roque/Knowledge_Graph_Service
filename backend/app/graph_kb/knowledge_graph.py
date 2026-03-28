@@ -237,6 +237,53 @@ class KnowledgeGraph:
             self.remove_node(nid)
         return len(to_remove)
 
+    def detect_knowledge_gaps(self) -> dict:
+        """Find nodes without document evidence (knowledge gaps)."""
+        all_nodes = self.all_nodes()
+        gaps = []
+        grounded = 0
+
+        for node in all_nodes:
+            if node.metadata.get("is_folder"):
+                continue
+            sources = node.metadata.get("source_files", [])
+            edges = len(self.edges_of_node(node.id))
+
+            if not sources and edges > 0:
+                gaps.append({
+                    "id": node.id,
+                    "label": node.label,
+                    "importance": round(node.importance, 2),
+                    "edges": edges,
+                })
+            elif sources:
+                grounded += 1
+
+        # Cluster-level gaps
+        clusters = self.detect_clusters()
+        cluster_gaps = []
+        for cluster in clusters.get("clusters", []):
+            cnodes = [self.get_node(nid) for nid in cluster.get("node_ids", [])]
+            cnodes = [n for n in cnodes if n and not n.metadata.get("is_folder")]
+            if not cnodes:
+                continue
+            with_sources = sum(1 for n in cnodes if n.metadata.get("source_files"))
+            coverage = with_sources / len(cnodes)
+            if coverage < 0.5:
+                cluster_gaps.append({
+                    "cluster": cluster.get("label", "?"),
+                    "size": cluster.get("size", 0),
+                    "coverage": f"{coverage:.0%}",
+                })
+
+        return {
+            "total_nodes": len(all_nodes),
+            "grounded_nodes": grounded,
+            "gap_nodes": sorted(gaps, key=lambda g: g["importance"], reverse=True)[:20],
+            "gap_count": len(gaps),
+            "cluster_gaps": cluster_gaps,
+        }
+
     @property
     def node_count(self) -> int:
         return self._graph.number_of_nodes()

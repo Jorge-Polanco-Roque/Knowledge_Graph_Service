@@ -31,6 +31,9 @@ class Settings(BaseSettings):
     consolidation_threshold: float = 0.7
     spreading_factor: float = 0.5
 
+    # Query routing
+    routing_model: str = "gpt-4o-mini"
+
     # Context mode: "chunks_only" (Mode D) or "graph_and_chunks" (Mode A)
     # chunks_only: only RAG document chunks, no graph context (more accurate, less noise)
     # graph_and_chunks: graph context + RAG chunks (richer connections, but may infer from labels)
@@ -42,8 +45,8 @@ class Settings(BaseSettings):
     max_edges_per_node: int = 30
 
     # RAG / Document Store
-    rag_chunk_size: int = 600
-    rag_chunk_overlap: int = 100
+    rag_chunk_size: int = 800
+    rag_chunk_overlap: int = 150
     rag_top_k: int = 7
     rag_embedding_model: str = "text-embedding-3-small"
 

@@ -31,6 +31,7 @@ from ..agent.nodes import (
     _grounding_check,
     activate_memory,
     build_context,
+    classify_query,
     extract_concepts,
     retrieve_documents,
     update_graph,
@@ -184,11 +185,27 @@ async def _run_agent_streaming(
     state: dict = {"messages": messages, "user_id": user_id}
     loop = asyncio.get_event_loop()
 
-    # Phase 1: Pre-generation pipeline
-    state.update(await loop.run_in_executor(None, extract_concepts, state))
-    state.update(await loop.run_in_executor(None, activate_memory, state))
-    state.update(await loop.run_in_executor(None, retrieve_documents, state))
-    state.update(await loop.run_in_executor(None, build_context, state))
+    # Query routing: classify to determine pipeline depth
+    user_content = messages[-1].content if messages else ""
+    route = await loop.run_in_executor(None, classify_query, user_content)
+    logger.info("Query route: %s for '%s'", route, user_content[:50])
+
+    if route == "greeting":
+        # Skip the entire pipeline for greetings
+        state["graph_context"] = ""
+        state["extracted_concepts"] = []
+        state["document_chunks"] = []
+    elif route == "simple":
+        # RAG only, skip graph activation (faster)
+        state.update(await loop.run_in_executor(None, extract_concepts, state))
+        state.update(await loop.run_in_executor(None, retrieve_documents, state))
+        state.update(await loop.run_in_executor(None, build_context, state))
+    else:
+        # Full pipeline for complex queries
+        state.update(await loop.run_in_executor(None, extract_concepts, state))
+        state.update(await loop.run_in_executor(None, activate_memory, state))
+        state.update(await loop.run_in_executor(None, retrieve_documents, state))
+        state.update(await loop.run_in_executor(None, build_context, state))
 
     # Phase 2: Stream LLM response
     graph_context = state.get("graph_context", "")

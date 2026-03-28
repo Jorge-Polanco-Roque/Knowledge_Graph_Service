@@ -46,7 +46,7 @@ class DocumentStore:
         self._splitter = RecursiveCharacterTextSplitter(
             chunk_size=settings.rag_chunk_size,
             chunk_overlap=settings.rag_chunk_overlap,
-            separators=["\n\n", "\n", ". ", " "],
+            separators=["\n\n\n", "\n\n", "\n", ". ", "? ", "! ", " "],
         )
 
     def ingest(self, content: str, metadata: dict[str, Any]) -> int:
@@ -148,6 +148,15 @@ class DocumentStore:
         if not source_files or self._collection.count() == 0:
             return []
         return self.search(query, top_k=top_k, where={"source_file": {"$in": source_files}})
+
+    def list_source_files(self) -> list[str]:
+        """Return all unique source_file values in the collection."""
+        if self._collection.count() == 0:
+            return []
+        all_meta = self._collection.get(include=["metadatas"])
+        return list(set(
+            m.get("source_file", "") for m in all_meta["metadatas"] if m.get("source_file")
+        ))
 
     def delete_by_source(self, source_file: str) -> None:
         """Remove all chunks from a specific source file (for re-ingestion)."""

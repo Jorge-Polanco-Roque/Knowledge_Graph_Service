@@ -168,6 +168,63 @@ async def deduplicate_graph(user_id: str, threshold: float = 0.85) -> dict[str, 
         raise HTTPException(status_code=500, detail=str(exc))
 
 
+@router.get("/graph/{user_id}/timeline")
+async def get_timeline(user_id: str) -> list[dict[str, Any]]:
+    """List all graph timeline snapshots."""
+    _validate_user_id(user_id)
+    from ..graph_kb.timeline import list_snapshots
+    return list_snapshots(user_id)
+
+
+@router.get("/graph/{user_id}/gaps")
+async def knowledge_gaps(user_id: str) -> dict[str, Any]:
+    """Detect knowledge gaps: nodes without document evidence."""
+    _validate_user_id(user_id)
+    try:
+        mm = _get_memory_manager(user_id)
+        return mm.graph.detect_knowledge_gaps()
+    except Exception as exc:
+        logger.error("Knowledge gaps error: %s", exc, exc_info=True)
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@router.post("/feedback/{user_id}")
+async def submit_feedback(user_id: str, feedback: dict[str, Any]) -> dict[str, str]:
+    """Store user feedback (thumbs up/down) for a response."""
+    _validate_user_id(user_id)
+    import json as _json
+    feedback_dir = settings.data_dir / "users" / user_id
+    feedback_dir.mkdir(parents=True, exist_ok=True)
+    filepath = feedback_dir / "feedback.jsonl"
+    with open(filepath, "a", encoding="utf-8") as f:
+        f.write(_json.dumps(feedback, ensure_ascii=False) + "\n")
+    return {"status": "ok"}
+
+
+@router.get("/feedback/{user_id}/summary")
+async def feedback_summary(user_id: str) -> dict[str, Any]:
+    """Summarize user feedback."""
+    _validate_user_id(user_id)
+    import json as _json
+    filepath = settings.data_dir / "users" / user_id / "feedback.jsonl"
+    if not filepath.exists():
+        return {"total": 0, "positive": 0, "negative": 0}
+    entries = []
+    for line in filepath.read_text("utf-8").strip().split("\n"):
+        if line:
+            entries.append(_json.loads(line))
+    positive = sum(1 for e in entries if e.get("rating", 0) > 0)
+    negative = sum(1 for e in entries if e.get("rating", 0) < 0)
+    return {
+        "total": len(entries),
+        "positive": positive,
+        "negative": negative,
+        "worst_queries": [
+            e.get("query", "")[:100] for e in entries if e.get("rating", 0) < 0
+        ][:10],
+    }
+
+
 @router.delete("/graph/{user_id}")
 async def reset_graph(user_id: str) -> dict[str, str]:
     """Full reset: clear knowledge graph, ChromaDB chunks, and embedding cache."""

@@ -25,8 +25,17 @@ interface GraphLink {
 // Cache textures so we don't recreate every frame
 const textureCache = new Map<string, THREE.CanvasTexture>();
 
-function createPillTexture(label: string, color: string, isSTM: boolean): THREE.CanvasTexture {
-  const key = `${label}|${color}|${isSTM}`;
+function computeConfidence(node: { metadata?: Record<string, any>; activation_count?: number }): number {
+  const sources = (node.metadata?.source_files as string[] | undefined)?.length || 0;
+  const activations = node.activation_count || 0;
+  const sourceScore = Math.min(sources / 3, 1.0);
+  const activationScore = Math.min(activations / 5, 1.0);
+  return sourceScore * 0.6 + activationScore * 0.4;
+}
+
+function createPillTexture(label: string, color: string, isSTM: boolean, confidence: number = 1.0): THREE.CanvasTexture {
+  const confKey = Math.round(confidence * 10); // Bucket to 10 levels for caching
+  const key = `${label}|${color}|${isSTM}|${confKey}`;
   const cached = textureCache.get(key);
   if (cached) return cached;
 
@@ -47,9 +56,9 @@ function createPillTexture(label: string, color: string, isSTM: boolean): THREE.
 
   const radius = h / 2;
 
-  // Pill background
+  // Pill background — opacity reflects confidence
   ctx.fillStyle = color;
-  ctx.globalAlpha = 0.92;
+  ctx.globalAlpha = 0.4 + confidence * 0.55;
   ctx.beginPath();
   ctx.roundRect(2, 2, w - 4, h - 4, radius - 2);
   ctx.fill();
@@ -313,7 +322,7 @@ export function BrainGraph() {
 
     const texture = isActivated
       ? createActivatedPillTexture(node.label, color)
-      : createPillTexture(node.label, color, node.memory_type === 'stm');
+      : createPillTexture(node.label, color, node.memory_type === 'stm', computeConfidence(node));
 
     const mat = new THREE.SpriteMaterial({ map: texture, transparent: true, depthWrite: false });
     const sprite = new THREE.Sprite(mat);
