@@ -43,6 +43,9 @@ The application features a split-view interface: a **3D interactive brain visual
 - **Semantic Deduplication** — Embedding-based cosine similarity detects and merges quasi-duplicate nodes (e.g., "AI Fairness" + "Fairness in AI"), cleaning the graph and consolidating knowledge
 - **Cluster Summaries** — LLM-generated 2-3 sentence descriptions per cluster, using top nodes + relationships + document excerpts
 - **Response Visualization** — Activated nodes glow in the 3D graph when the agent responds; camera flies to the activation region; fades after 8 seconds
+- **Grounding & Anti-Hallucination** — Post-processing grounding check verifies specific claims (article numbers, statistics, citations) against the context. Self-hallucination loop prevention: conversation files excluded from RAG to prevent the agent from citing its own previous hallucinations as evidence. Documents are the primary source of truth over graph inferences
+- **Streaming Responses** — Token-level WebSocket streaming. Pre-generation pipeline runs first (~1.5s), then LLM tokens stream in real-time. Time-to-first-token drops from 5-10s to ~1.5s
+- **Security** — Prompt injection defense (immutable identity, injection pattern detection), concept sanitization (blocklist for sensitive terms), user ID validation (regex, prevents path traversal)
 - **Intelligent Agent** — Critical thinking system prompt that challenges false premises, grounds responses in graph knowledge via fuzzy concept matching, and validates relationship types
 - **AI-Powered Concept Extraction** — GPT-4o extracts entities, relationships, and semantic meaning from natural conversation
 - **File Ingestion** — Ingest documents (.docx, .pdf, .xlsx, .pptx, .csv, .json, .txt, .md), code files, and images (via GPT-4o vision) to bootstrap your knowledge graph

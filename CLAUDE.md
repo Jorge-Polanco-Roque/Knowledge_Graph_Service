@@ -72,6 +72,11 @@ backend/ (Python + FastAPI)
 - **Semantic deduplication**: `NodeDeduplicator` embeds all node labels, computes cosine similarity matrix, merges nodes above threshold (default 0.85). Union-Find groups duplicates, primary node (highest importance) absorbs metadata/edges/source_files. Endpoint: `POST /api/graph/{user_id}/deduplicate`.
 - **Cluster summaries**: LLM-generated 2-3 sentence descriptions per cluster. Uses top 10 nodes + relationships + sample document chunks. Endpoint: `POST /api/graph/{user_id}/summarize-clusters`. Summary shown in cluster legend tooltip.
 - **Response visualization**: Activated nodes glow with `createActivatedPillTexture` (brighter fill, white border, outer glow). Camera flies to activation region. Auto-clears after 8 seconds. Uses existing `activatedNodes` from WebSocket `GraphDiff`.
+- **Grounding check**: Post-processing that scans LLM responses for specific claims (article numbers, statistics, author citations, dates) and verifies they appear in the graph context. If >2 unverified claims found, appends a transparency disclaimer. Deterministic (zero extra LLM calls).
+- **Anti-hallucination: self-reference loop prevention**: Conversation files (`chat_*.md`) are excluded from RAG ingestion. Previously, hallucinated agent responses were saved as conversations, ingested as chunks, and returned by RAG as "evidence" — creating a self-reinforcing hallucination loop. Document excerpts are now the primary source of truth, overriding graph node label inferences.
+- **Prompt injection defense**: Immutable identity block at top of system prompt prevents persona override attacks. Input sanitization detects common injection patterns and logs warnings.
+- **Concept sanitization**: Blocklist filters sensitive terms (password, credential, secret_key, etc.) from being created as graph nodes.
+- **User ID validation**: Regex `[a-zA-Z0-9_-]{1,64}` on all endpoints and WebSocket to prevent path traversal.
 
 ### Performance Optimizations (validated through stress testing)
 
