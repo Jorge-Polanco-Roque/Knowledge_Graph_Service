@@ -1,0 +1,23 @@
+services:
+  brain:
+    build: ./backend
+    container_name: neurograph-brain
+    ports:
+      - "${NEUROGRAPH_PORT:-8899}:8899"
+    volumes:
+      - neurograph-data:/data
+      - ./backend/inputs:/inputs:ro
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - NEUROGRAPH_API_KEY=${NEUROGRAPH_API_KEY}
+      - OPENAI_MODEL=${OPENAI_MODEL:-gpt-4o}
+      - DATA_DIR=/data
+      - CORS_ORIGINS=${CORS_ORIGINS:-["*"]}
+      - LOG_LEVEL=${LOG_LEVEL:-warning}
+    restart: unless-stopped
+    mem_limit: 2g
+    cpus: 2.0
+
+volumes:
+  neurograph-data:
+    driver: local

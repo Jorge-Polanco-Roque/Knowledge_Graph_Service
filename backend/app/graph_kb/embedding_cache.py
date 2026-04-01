@@ -10,6 +10,7 @@ from typing import Any
 import numpy as np
 from langchain_openai import OpenAIEmbeddings
 
+from ..api.context import current_openai_key
 from ..config import settings
 from .knowledge_graph import KnowledgeGraph
 
@@ -35,10 +36,6 @@ class NodeEmbeddingCache:
     def __init__(self, user_id: str, data_dir: Path) -> None:
         self._user_id = user_id
         self._path = data_dir / "users" / user_id / "node_embeddings.npz"
-        self._embeddings_model = OpenAIEmbeddings(
-            model=settings.rag_embedding_model,
-            api_key=settings.openai_api_key,
-        )
         self._ids: np.ndarray | None = None
         self._embeddings: np.ndarray | None = None
         self._version: str = ""
@@ -66,6 +63,14 @@ class NodeEmbeddingCache:
             ids=self._ids,
             embeddings=self._embeddings,
             version=np.array(self._version),
+        )
+
+    def _get_embeddings_model(self) -> OpenAIEmbeddings:
+        """Get embeddings model using the current request's OpenAI key."""
+        api_key = current_openai_key.get(settings.openai_api_key)
+        return OpenAIEmbeddings(
+            model=settings.rag_embedding_model,
+            api_key=api_key,
         )
 
     def _compute_version(self, node_ids: list[str]) -> str:
@@ -102,7 +107,7 @@ class NodeEmbeddingCache:
             self._save()
             return
 
-        raw_embeddings = self._embeddings_model.embed_documents(labels)
+        raw_embeddings = self._get_embeddings_model().embed_documents(labels)
         self._ids = np.array(ids)
         self._embeddings = np.array(raw_embeddings)
         self._version = current_version
@@ -120,7 +125,7 @@ class NodeEmbeddingCache:
         if self._embeddings is None or len(self._embeddings) == 0:
             return {}
 
-        query_embedding = np.array(self._embeddings_model.embed_query(query))
+        query_embedding = np.array(self._get_embeddings_model().embed_query(query))
 
         # Cosine similarity: dot(q, E) / (||q|| × ||E||)
         norms = np.linalg.norm(self._embeddings, axis=1)

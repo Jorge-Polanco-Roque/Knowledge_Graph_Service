@@ -1,0 +1,36 @@
+# === SECRETS — NEVER include in image ===
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.crt
+
+# === Data — mounted at runtime via volumes ===
+data/
+inputs/
+
+# === Dev tools — not needed in production ===
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+tests/
+etc/
+
+# === Git & IDE ===
+.git/
+.gitignore
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# === Documentation (not needed in runtime) ===
+README.md
+CLAUDE.md
+Whitepaper_*.md
+screenshots/

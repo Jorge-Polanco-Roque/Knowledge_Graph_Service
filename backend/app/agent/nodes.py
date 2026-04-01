@@ -8,6 +8,7 @@ from typing import Any
 
 from langchain_openai import ChatOpenAI
 
+from ..api.context import current_openai_key
 from ..config import settings
 from ..graph_kb.memory import MemoryManager
 from ..models.graph import GraphDiff
@@ -32,12 +33,17 @@ Message: {message}
 Reply with ONLY one word: greeting, simple, or complex."""
 
 
+def _get_openai_key() -> str:
+    """Get the effective OpenAI API key (per-request or global default)."""
+    return current_openai_key.get(settings.openai_api_key)
+
+
 def classify_query(message: str) -> str:
     """Classify a query to determine which pipeline route to use."""
     try:
         llm = ChatOpenAI(
             model=settings.routing_model,
-            api_key=settings.openai_api_key,
+            api_key=_get_openai_key(),
             temperature=0,
             max_tokens=10,
         )
@@ -68,7 +74,7 @@ def reset_memory_manager(user_id: str) -> None:
 def _get_llm() -> ChatOpenAI:
     return ChatOpenAI(
         model=settings.openai_model,
-        api_key=settings.openai_api_key,
+        api_key=_get_openai_key(),
         temperature=0.3,
     )
 

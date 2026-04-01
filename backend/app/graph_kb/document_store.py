@@ -11,6 +11,7 @@ import chromadb
 from langchain_openai import OpenAIEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
+from ..api.context import current_openai_key
 from ..config import settings
 
 logger = logging.getLogger(__name__)
@@ -39,14 +40,19 @@ class DocumentStore:
             name="documents",
             metadata={"hnsw:space": "cosine"},
         )
-        self._embeddings = OpenAIEmbeddings(
-            model=settings.rag_embedding_model,
-            api_key=settings.openai_api_key,
-        )
+        self._embeddings: OpenAIEmbeddings | None = None
         self._splitter = RecursiveCharacterTextSplitter(
             chunk_size=settings.rag_chunk_size,
             chunk_overlap=settings.rag_chunk_overlap,
             separators=["\n\n\n", "\n\n", "\n", ". ", "? ", "! ", " "],
+        )
+
+    def _get_embeddings(self) -> OpenAIEmbeddings:
+        """Get embeddings model using the current request's OpenAI key."""
+        api_key = current_openai_key.get(settings.openai_api_key)
+        return OpenAIEmbeddings(
+            model=settings.rag_embedding_model,
+            api_key=api_key,
         )
 
     def ingest(self, content: str, metadata: dict[str, Any]) -> int:
@@ -78,7 +84,7 @@ class DocumentStore:
         ]
 
         # Embed all chunks in one batch call
-        embeddings = self._embeddings.embed_documents(chunks)
+        embeddings = self._get_embeddings().embed_documents(chunks)
 
         # Upsert into ChromaDB
         self._collection.upsert(
@@ -100,7 +106,7 @@ class DocumentStore:
             f"{self._user_id}:summary:{source_file}".encode()
         ).hexdigest()
 
-        embedding = self._embeddings.embed_documents([summary])[0]
+        embedding = self._get_embeddings().embed_documents([summary])[0]
 
         self._collection.upsert(
             ids=[chunk_id],
@@ -118,7 +124,7 @@ class DocumentStore:
 
         top_k = top_k or settings.rag_top_k
 
-        query_embedding = self._embeddings.embed_query(query)
+        query_embedding = self._get_embeddings().embed_query(query)
 
         kwargs: dict[str, Any] = {
             "query_embeddings": [query_embedding],

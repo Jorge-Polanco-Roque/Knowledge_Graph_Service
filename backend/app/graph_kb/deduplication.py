@@ -8,6 +8,7 @@ from typing import Any
 import numpy as np
 from langchain_openai import OpenAIEmbeddings
 
+from ..api.context import current_openai_key
 from ..config import settings
 from ..models.graph import EdgeData
 from .knowledge_graph import KnowledgeGraph
@@ -20,9 +21,10 @@ class NodeDeduplicator:
 
     def __init__(self, graph: KnowledgeGraph) -> None:
         self._graph = graph
+        api_key = current_openai_key.get(settings.openai_api_key)
         self._embeddings = OpenAIEmbeddings(
             model=settings.rag_embedding_model,
-            api_key=settings.openai_api_key,
+            api_key=api_key,
         )
 
     def find_duplicates(self, threshold: float = 0.85) -> list[list[str]]:

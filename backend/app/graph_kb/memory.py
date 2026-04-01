@@ -81,6 +81,10 @@ class MemoryManager:
                     continue
 
                 category = concept.get("category", "concept")
+                # Validate category against enum; fallback to "concept"
+                _valid_categories = {"person", "place", "concept", "action", "object", "event"}
+                if category not in _valid_categories:
+                    category = "concept"
                 node_id = self._label_to_id(label)
 
                 existing = self.graph.get_node(node_id)

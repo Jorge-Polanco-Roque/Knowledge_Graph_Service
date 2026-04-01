@@ -5,10 +5,14 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import time
 import traceback
 
 from fastapi import WebSocket, WebSocketDisconnect
 from langchain_openai import ChatOpenAI
+
+from .auth import validate_ws_token
+from .context import current_openai_key
 
 # --- Security: Prompt injection detection ---
 _INJECTION_PATTERNS = [
@@ -19,6 +23,14 @@ _INJECTION_PATTERNS = [
     "do not follow", "bypass your", "jailbreak",
 ]
 _VALID_USER_ID = re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
+
+# --- Connection & rate limits ---
+MAX_CONNECTIONS_PER_USER = 3
+MAX_MESSAGE_LENGTH = 10_000
+MIN_MESSAGE_INTERVAL = 1.0  # seconds
+
+_active_connections: dict[str, int] = {}
+_last_message_time: dict[str, float] = {}
 
 
 def _check_injection(content: str) -> bool:
@@ -65,8 +77,26 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str) -> None:
         await websocket.close(code=4000, reason="Invalid user_id")
         return
 
+    # --- Auth: validate API key ---
+    if not validate_ws_token(websocket):
+        await websocket.close(code=4003, reason="Invalid or missing API key")
+        return
+
+    # --- Connection limit per user ---
+    count = _active_connections.get(user_id, 0)
+    if count >= MAX_CONNECTIONS_PER_USER:
+        await websocket.close(code=4029, reason="Too many connections")
+        return
+
     await websocket.accept()
-    logger.info("WebSocket connected: user_id=%s", user_id)
+    _active_connections[user_id] = count + 1
+    logger.info("WebSocket connected: user_id=%s (connections: %d)", user_id, count + 1)
+
+    # Resolve the OpenAI key for this connection
+    # WS clients can pass it as a query param: ?openai_key=sk-...
+    ws_openai_key = websocket.query_params.get("openai_key", "").strip()
+    if not ws_openai_key:
+        ws_openai_key = settings.openai_api_key
 
     conversation: list[ChatMessage] = []
 
@@ -85,6 +115,29 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str) -> None:
                 continue
 
             content = raw.get("data", {}).get("content", "").strip()
+
+            # --- Message length limit ---
+            if len(content) > MAX_MESSAGE_LENGTH:
+                await websocket.send_json(
+                    WSMessage(
+                        type=WSMessageType.ERROR,
+                        data={"message": f"Message too long. Max {MAX_MESSAGE_LENGTH} characters."},
+                    ).model_dump(mode="json")
+                )
+                continue
+
+            # --- Message rate limit ---
+            now = time.monotonic()
+            last = _last_message_time.get(user_id, 0)
+            if now - last < MIN_MESSAGE_INTERVAL:
+                await websocket.send_json(
+                    WSMessage(
+                        type=WSMessageType.ERROR,
+                        data={"message": "Rate limit: wait 1 second between messages."},
+                    ).model_dump(mode="json")
+                )
+                continue
+            _last_message_time[user_id] = now
 
             # Prompt injection detection — don't block, but flag for the LLM
             if _check_injection(content):
@@ -105,15 +158,20 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str) -> None:
 
             # Run the streaming agent pipeline
             try:
-                result = await _run_agent_streaming(
-                    user_id, list(conversation), websocket
-                )
+                # Set the OpenAI key for this request scope
+                token = current_openai_key.set(ws_openai_key)
+                try:
+                    result = await _run_agent_streaming(
+                        user_id, list(conversation), websocket
+                    )
+                finally:
+                    current_openai_key.reset(token)
             except Exception as exc:
-                logger.error("Agent error: %s\n%s", exc, traceback.format_exc())
+                logger.error("Agent error: %s", exc, exc_info=True)
                 await websocket.send_json(
                     WSMessage(
                         type=WSMessageType.ERROR,
-                        data={"message": f"Agent error: {str(exc)}"},
+                        data={"message": "An error occurred processing your message."},
                     ).model_dump(mode="json")
                 )
                 continue
@@ -159,18 +217,16 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str) -> None:
 
     except WebSocketDisconnect:
         logger.info("WebSocket disconnected: user_id=%s", user_id)
-    except Exception as exc:
-        logger.error(
-            "WebSocket error for user_id=%s: %s\n%s",
-            user_id, exc, traceback.format_exc(),
-        )
+    except Exception:
+        logger.exception("WebSocket error for user_id=%s", user_id)
     finally:
+        _active_connections[user_id] = max(0, _active_connections.get(user_id, 1) - 1)
         if len(conversation) >= 2:
             try:
                 msgs = [{"role": m.role.value, "content": m.content} for m in conversation]
                 save_conversation(user_id, msgs)
-            except Exception as exc:
-                logger.error("Failed to save conversation: %s", exc)
+            except Exception:
+                logger.exception("Failed to save conversation for %s", user_id)
 
 
 async def _run_agent_streaming(
@@ -217,9 +273,14 @@ async def _run_agent_streaming(
     for msg in messages:
         llm_messages.append({"role": msg.role.value, "content": msg.content})
 
+    # Use the per-request OpenAI key from contextvar
+    api_key = current_openai_key.get(settings.openai_api_key)
+    if not api_key:
+        raise ValueError("No OpenAI API key configured. Provide via X-OpenAI-Key header or OPENAI_API_KEY env var.")
+
     llm = ChatOpenAI(
         model=settings.openai_model,
-        api_key=settings.openai_api_key,
+        api_key=api_key,
         temperature=0.3,
         streaming=True,
     )

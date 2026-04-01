@@ -32,5 +32,11 @@ screenshots/
 # Playwright
 test_visual.*
 
+# Conversations (auto-generated at runtime)
+backend/inputs/conversations/
+
+# Docker volumes
+neurograph-data/
+
 # Temp
 *.log

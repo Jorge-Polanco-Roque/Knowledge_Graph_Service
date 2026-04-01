@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     rag_top_k: int = 7
     rag_embedding_model: str = "text-embedding-3-small"
 
+    # Service auth (empty = auth disabled for local dev)
+    neurograph_api_key: str = ""
+
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "env_file_override": True}
 
 

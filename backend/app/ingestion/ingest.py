@@ -162,9 +162,11 @@ Extract 3-20 concepts. Every relationship target must also appear as a concept.
 # ------------------------------------------------------------------
 
 def _get_llm() -> ChatOpenAI:
+    from ..api.context import current_openai_key
+    api_key = current_openai_key.get(settings.openai_api_key)
     return ChatOpenAI(
         model=settings.openai_model,
-        api_key=settings.openai_api_key,
+        api_key=api_key,
         temperature=0.2,
     )
 

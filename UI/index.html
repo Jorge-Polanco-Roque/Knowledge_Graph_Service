@@ -1,0 +1,421 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>NeuroGraph Brain — Test UI</title>
+    <style>
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: #0d1117;
+            color: #e6edf3;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+        }
+
+        /* --- Header --- */
+        .header {
+            padding: 12px 20px;
+            border-bottom: 1px solid #21262d;
+            display: flex;
+            align-items: center;
+            gap: 12px;
+            flex-shrink: 0;
+        }
+
+        .header h1 {
+            font-size: 16px;
+            font-weight: 600;
+        }
+
+        .status {
+            font-size: 12px;
+            padding: 3px 10px;
+            border-radius: 12px;
+            background: #1c1c1c;
+        }
+
+        .status.connected { background: #0d3321; color: #3fb950; }
+        .status.disconnected { background: #3d1d1d; color: #f85149; }
+        .status.connecting { background: #2d2000; color: #d29922; }
+
+        /* --- Config bar --- */
+        .config {
+            padding: 10px 20px;
+            border-bottom: 1px solid #21262d;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-wrap: wrap;
+            flex-shrink: 0;
+        }
+
+        .config label {
+            font-size: 12px;
+            color: #8b949e;
+        }
+
+        .config input {
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 6px;
+            padding: 5px 10px;
+            color: #e6edf3;
+            font-size: 13px;
+            font-family: monospace;
+        }
+
+        .config input.short { width: 120px; }
+        .config input.medium { width: 200px; }
+        .config input.long { width: 280px; }
+
+        .config button {
+            background: #238636;
+            color: #fff;
+            border: none;
+            border-radius: 6px;
+            padding: 5px 14px;
+            font-size: 13px;
+            cursor: pointer;
+        }
+
+        .config button:hover { background: #2ea043; }
+        .config button.danger { background: #da3633; }
+        .config button.danger:hover { background: #f85149; }
+
+        /* --- Messages --- */
+        .messages {
+            flex: 1;
+            overflow-y: auto;
+            padding: 20px;
+            display: flex;
+            flex-direction: column;
+            gap: 12px;
+        }
+
+        .msg {
+            max-width: 75%;
+            padding: 10px 14px;
+            border-radius: 12px;
+            font-size: 14px;
+            line-height: 1.5;
+            white-space: pre-wrap;
+            word-wrap: break-word;
+        }
+
+        .msg.user {
+            align-self: flex-end;
+            background: #1f6feb;
+            border-bottom-right-radius: 4px;
+        }
+
+        .msg.assistant {
+            align-self: flex-start;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-bottom-left-radius: 4px;
+        }
+
+        .msg.system {
+            align-self: center;
+            background: transparent;
+            color: #8b949e;
+            font-size: 12px;
+            font-style: italic;
+        }
+
+        .msg.error {
+            align-self: center;
+            background: #3d1d1d;
+            color: #f85149;
+            font-size: 12px;
+        }
+
+        .msg .meta {
+            font-size: 11px;
+            color: #8b949e;
+            margin-top: 6px;
+        }
+
+        .streaming-cursor::after {
+            content: '|';
+            animation: blink 0.7s infinite;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0; }
+        }
+
+        /* --- Input bar --- */
+        .input-bar {
+            padding: 12px 20px;
+            border-top: 1px solid #21262d;
+            display: flex;
+            gap: 10px;
+            flex-shrink: 0;
+        }
+
+        .input-bar input {
+            flex: 1;
+            background: #161b22;
+            border: 1px solid #30363d;
+            border-radius: 8px;
+            padding: 10px 14px;
+            color: #e6edf3;
+            font-size: 14px;
+            outline: none;
+        }
+
+        .input-bar input:focus { border-color: #1f6feb; }
+        .input-bar input:disabled { opacity: 0.5; }
+
+        .input-bar button {
+            background: #1f6feb;
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            padding: 10px 20px;
+            font-size: 14px;
+            cursor: pointer;
+        }
+
+        .input-bar button:hover { background: #388bfd; }
+        .input-bar button:disabled { opacity: 0.4; cursor: default; }
+    </style>
+</head>
+<body>
+    <!-- Header -->
+    <div class="header">
+        <h1>NeuroGraph Brain — Test UI</h1>
+        <span id="status" class="status disconnected">Disconnected</span>
+    </div>
+
+    <!-- Config -->
+    <div class="config">
+        <label>Host</label>
+        <input id="host" class="medium" value="localhost:8899" placeholder="localhost:8899">
+
+        <label>API Key</label>
+        <input id="apiKey" class="long" type="password" placeholder="nk_your_key_here">
+
+        <label>User ID</label>
+        <input id="userId" class="short" value="test-user" placeholder="user-id">
+
+        <button id="connectBtn" onclick="toggleConnection()">Connect</button>
+        <button class="danger" onclick="clearChat()">Clear</button>
+    </div>
+
+    <!-- Messages -->
+    <div class="messages" id="messages"></div>
+
+    <!-- Input -->
+    <div class="input-bar">
+        <input id="input" type="text" placeholder="Type a message..." disabled
+               onkeydown="if(event.key==='Enter')sendMessage()">
+        <button id="sendBtn" onclick="sendMessage()" disabled>Send</button>
+    </div>
+
+    <script>
+        let ws = null;
+        let streaming = false;
+
+        const $ = (id) => document.getElementById(id);
+
+        // --- Connection ---
+
+        function toggleConnection() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.close();
+            } else {
+                connect();
+            }
+        }
+
+        function connect() {
+            const host = $('host').value.trim();
+            const apiKey = $('apiKey').value.trim();
+            const userId = $('userId').value.trim() || 'test-user';
+
+            if (!host) return;
+
+            setStatus('connecting');
+
+            const proto = host.startsWith('localhost') || host.startsWith('127.') ? 'ws' : 'wss';
+            let url = `${proto}://${host}/ws/${userId}`;
+            if (apiKey) url += `?token=${encodeURIComponent(apiKey)}`;
+
+            ws = new WebSocket(url);
+
+            ws.onopen = () => {
+                setStatus('connected');
+                $('connectBtn').textContent = 'Disconnect';
+                $('input').disabled = false;
+                $('sendBtn').disabled = false;
+                $('input').focus();
+                addSystemMsg(`Connected to ${host} as "${userId}"`);
+            };
+
+            ws.onclose = (e) => {
+                setStatus('disconnected');
+                $('connectBtn').textContent = 'Connect';
+                $('input').disabled = true;
+                $('sendBtn').disabled = true;
+                const reason = e.reason || `code ${e.code}`;
+                addSystemMsg(`Disconnected: ${reason}`);
+                ws = null;
+            };
+
+            ws.onerror = () => {
+                addErrorMsg('WebSocket connection failed. Check host and API key.');
+            };
+
+            ws.onmessage = (event) => {
+                const msg = JSON.parse(event.data);
+                handleMessage(msg);
+            };
+        }
+
+        // --- Message handling ---
+
+        function handleMessage(msg) {
+            switch (msg.type) {
+                case 'response_chunk':
+                    if (!streaming) {
+                        streaming = true;
+                        addAssistantMsg('', true);
+                    }
+                    appendToLastAssistant(msg.data.content);
+                    break;
+
+                case 'response_end':
+                    streaming = false;
+                    finalizeLastAssistant(msg.data);
+                    $('input').disabled = false;
+                    $('sendBtn').disabled = false;
+                    $('input').focus();
+                    break;
+
+                case 'graph_diff':
+                    const diff = msg.data;
+                    const added = (diff.node_diffs || []).filter(d => d.action === 'added').length;
+                    const updated = (diff.node_diffs || []).filter(d => d.action === 'updated').length;
+                    const activated = (diff.activated_nodes || []).length;
+                    if (added || updated || activated) {
+                        addSystemMsg(`Graph: +${added} nodes, ~${updated} updated, ${activated} activated`);
+                    }
+                    break;
+
+                case 'spreading_activation':
+                    const waves = msg.data.waves || [];
+                    if (waves.length > 0) {
+                        const total = waves.reduce((s, w) => s + w.length, 0);
+                        addSystemMsg(`Spreading activation: ${waves.length} waves, ${total} nodes`);
+                    }
+                    break;
+
+                case 'error':
+                    addErrorMsg(msg.data.message || 'Unknown error');
+                    streaming = false;
+                    $('input').disabled = false;
+                    $('sendBtn').disabled = false;
+                    break;
+            }
+        }
+
+        function sendMessage() {
+            const input = $('input');
+            const text = input.value.trim();
+            if (!text || !ws || ws.readyState !== WebSocket.OPEN) return;
+
+            addUserMsg(text);
+            ws.send(JSON.stringify({
+                type: 'user_message',
+                data: { content: text }
+            }));
+
+            input.value = '';
+            input.disabled = true;
+            $('sendBtn').disabled = true;
+        }
+
+        // --- DOM helpers ---
+
+        function addUserMsg(text) {
+            const div = document.createElement('div');
+            div.className = 'msg user';
+            div.textContent = text;
+            $('messages').appendChild(div);
+            scrollBottom();
+        }
+
+        function addAssistantMsg(text, isStreaming) {
+            const div = document.createElement('div');
+            div.className = 'msg assistant' + (isStreaming ? ' streaming-cursor' : '');
+            div.id = 'current-assistant';
+            div.textContent = text;
+            $('messages').appendChild(div);
+            scrollBottom();
+        }
+
+        function appendToLastAssistant(chunk) {
+            const el = $('current-assistant');
+            if (el) {
+                el.textContent += chunk;
+                scrollBottom();
+            }
+        }
+
+        function finalizeLastAssistant(data) {
+            const el = $('current-assistant');
+            if (el) {
+                el.classList.remove('streaming-cursor');
+                el.removeAttribute('id');
+
+                // Show concepts if any
+                const concepts = data.extracted_concepts || [];
+                if (concepts.length > 0) {
+                    const meta = document.createElement('div');
+                    meta.className = 'meta';
+                    meta.textContent = 'Concepts: ' + concepts.map(c => c.label).join(', ');
+                    el.appendChild(meta);
+                }
+            }
+        }
+
+        function addSystemMsg(text) {
+            const div = document.createElement('div');
+            div.className = 'msg system';
+            div.textContent = text;
+            $('messages').appendChild(div);
+            scrollBottom();
+        }
+
+        function addErrorMsg(text) {
+            const div = document.createElement('div');
+            div.className = 'msg error';
+            div.textContent = text;
+            $('messages').appendChild(div);
+            scrollBottom();
+        }
+
+        function clearChat() {
+            $('messages').innerHTML = '';
+        }
+
+        function scrollBottom() {
+            const el = $('messages');
+            el.scrollTop = el.scrollHeight;
+        }
+
+        function setStatus(state) {
+            const el = $('status');
+            el.className = 'status ' + state;
+            el.textContent = state.charAt(0).toUpperCase() + state.slice(1);
+        }
+    </script>
+</body>
+</html>

@@ -7,6 +7,7 @@ from typing import Any
 
 from langchain_openai import ChatOpenAI
 
+from ..api.context import current_openai_key
 from ..config import settings
 from .document_store import get_document_store
 from .knowledge_graph import KnowledgeGraph
@@ -37,9 +38,10 @@ def generate_cluster_summaries(
     user_id: str,
 ) -> list[dict[str, Any]]:
     """Generate LLM summaries for each cluster. Modifies clusters in place and returns them."""
+    api_key = current_openai_key.get(settings.openai_api_key)
     llm = ChatOpenAI(
         model=settings.openai_model,
-        api_key=settings.openai_api_key,
+        api_key=api_key,
         temperature=0.2,
     )
 

@@ -7,9 +7,12 @@ import re
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 _VALID_USER_ID = re.compile(r'^[a-zA-Z0-9_-]{1,64}$')
+_VALID_FILENAME = re.compile(
+    r'^[a-zA-Z0-9_\-. ]+\.(docx|pdf|txt|md|csv|json|xlsx|pptx|py|js|ts|png|jpg|jpeg|gif|webp)$'
+)
 
 
 def _validate_user_id(user_id: str) -> str:
@@ -20,6 +23,7 @@ def _validate_user_id(user_id: str) -> str:
             detail="Invalid user_id. Only alphanumeric, hyphens, and underscores allowed (max 64 chars).",
         )
     return user_id
+
 
 from ..agent.graph_agent import create_agent
 from ..agent.nodes import _get_memory_manager, reset_memory_manager
@@ -36,13 +40,27 @@ _agent = create_agent()
 
 
 # ------------------------------------------------------------------
+# Health check (no auth required — used by Docker/LB)
+# ------------------------------------------------------------------
+
+@router.get("/health", tags=["system"])
+async def health_check() -> dict[str, str]:
+    """Liveness + readiness check for Docker and load balancers."""
+    return {"status": "healthy", "version": "1.0.0"}
+
+
+# ------------------------------------------------------------------
 # Request / response schemas
 # ------------------------------------------------------------------
 
+MAX_MESSAGE_LENGTH = 10_000
+MAX_HISTORY_LENGTH = 50
+
+
 class ChatRequest(BaseModel):
     user_id: str
-    message: str
-    history: list[dict[str, str]] = []  # Optional: [{"role": "user", "content": "..."}, ...]
+    message: str = Field(..., max_length=MAX_MESSAGE_LENGTH)
+    history: list[dict[str, str]] = Field(default=[], max_length=MAX_HISTORY_LENGTH)
 
 
 class ChatResponse(BaseModel):
@@ -79,9 +97,9 @@ async def chat(req: ChatRequest) -> ChatResponse:
 
     try:
         result = await _agent.ainvoke(initial_state)
-    except Exception as exc:
-        logger.error("Agent error: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=f"Agent error: {str(exc)}")
+    except Exception:
+        logger.exception("Agent error for user %s", req.user_id)
+        raise HTTPException(status_code=500, detail="Internal server error.")
 
     extracted = result.get("extracted_concepts", [])
     diff = result.get("graph_diff")
@@ -105,9 +123,9 @@ async def get_graph(user_id: str) -> dict[str, Any]:
         result["clusters"] = clusters["clusters"]
         result["node_cluster_map"] = clusters["node_cluster_map"]
         return result
-    except Exception as exc:
-        logger.error("Error fetching graph for %s: %s", user_id, exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception:
+        logger.exception("Error fetching graph for %s", user_id)
+        raise HTTPException(status_code=500, detail="Internal server error.")
 
 
 @router.get("/graph/{user_id}/stats")
@@ -117,14 +135,15 @@ async def get_graph_stats(user_id: str) -> dict[str, Any]:
     try:
         mm = _get_memory_manager(user_id)
         return mm.get_stats()
-    except Exception as exc:
-        logger.error("Error fetching stats for %s: %s", user_id, exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception:
+        logger.exception("Error fetching stats for %s", user_id)
+        raise HTTPException(status_code=500, detail="Internal server error.")
 
 
 @router.post("/graph/{user_id}/summarize-clusters")
 async def summarize_clusters(user_id: str) -> dict[str, Any]:
     """Generate LLM summaries for each cluster in the graph."""
+    _validate_user_id(user_id)
     try:
         from ..graph_kb.cluster_summarizer import generate_cluster_summaries
 
@@ -132,28 +151,30 @@ async def summarize_clusters(user_id: str) -> dict[str, Any]:
         cluster_data = mm.graph.detect_clusters()
         clusters = generate_cluster_summaries(mm.graph, cluster_data["clusters"], user_id)
         return {"clusters": clusters}
-    except Exception as exc:
-        logger.error("Cluster summary error for %s: %s", user_id, exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception:
+        logger.exception("Cluster summary error for %s", user_id)
+        raise HTTPException(status_code=500, detail="Internal server error.")
 
 
 @router.post("/graph/{user_id}/prune-ghosts")
 async def prune_ghost_nodes(user_id: str, min_importance: float = 0.3) -> dict[str, Any]:
     """Remove LTM nodes with 0 edges and low importance."""
+    _validate_user_id(user_id)
     try:
         mm = _get_memory_manager(user_id)
         removed = mm.graph.prune_ghost_nodes(min_importance)
         mm.save()
         reset_memory_manager(user_id)
         return {"nodes_removed": removed, "remaining_nodes": mm.graph.node_count}
-    except Exception as exc:
-        logger.error("Ghost pruning error for %s: %s", user_id, exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception:
+        logger.exception("Ghost pruning error for %s", user_id)
+        raise HTTPException(status_code=500, detail="Internal server error.")
 
 
 @router.post("/graph/{user_id}/deduplicate")
 async def deduplicate_graph(user_id: str, threshold: float = 0.85) -> dict[str, Any]:
     """Merge semantically duplicate nodes using embedding-based cosine similarity."""
+    _validate_user_id(user_id)
     try:
         from ..graph_kb.deduplication import NodeDeduplicator
 
@@ -163,9 +184,9 @@ async def deduplicate_graph(user_id: str, threshold: float = 0.85) -> dict[str, 
         mm.save()
         reset_memory_manager(user_id)
         return stats
-    except Exception as exc:
-        logger.error("Deduplication error for %s: %s", user_id, exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception:
+        logger.exception("Deduplication error for %s", user_id)
+        raise HTTPException(status_code=500, detail="Internal server error.")
 
 
 @router.get("/graph/{user_id}/timeline")
@@ -183,9 +204,9 @@ async def knowledge_gaps(user_id: str) -> dict[str, Any]:
     try:
         mm = _get_memory_manager(user_id)
         return mm.graph.detect_knowledge_gaps()
-    except Exception as exc:
-        logger.error("Knowledge gaps error: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception:
+        logger.exception("Knowledge gaps error for user %s", user_id)
+        raise HTTPException(status_code=500, detail="Internal server error.")
 
 
 @router.post("/feedback/{user_id}")
@@ -217,8 +238,8 @@ async def submit_feedback(user_id: str, feedback: dict[str, Any]) -> dict[str, s
                 },
             )
             logger.info("Stored user correction for %s: %s", user_id, comment[:80])
-        except Exception as e:
-            logger.warning("Failed to store correction: %s", e)
+        except Exception:
+            logger.exception("Failed to store correction for %s", user_id)
 
     return {"status": "ok"}
 
@@ -264,12 +285,11 @@ async def reset_graph(user_id: str) -> dict[str, str]:
         try:
             from ..graph_kb.document_store import get_document_store, _document_stores
             doc_store = get_document_store(user_id)
-            # Delete all documents in the collection
             if doc_store._collection.count() > 0:
                 doc_store._collection.delete(where={"source_file": {"$ne": ""}})
             _document_stores.pop(user_id, None)
-        except Exception as e:
-            logger.warning("Failed to clear ChromaDB for %s: %s", user_id, e)
+        except Exception:
+            logger.exception("Failed to clear ChromaDB for %s", user_id)
 
         # 3. Delete embedding cache
         try:
@@ -278,13 +298,13 @@ async def reset_graph(user_id: str) -> dict[str, str]:
                 cache_path.unlink()
             from ..graph_kb.embedding_cache import _caches
             _caches.pop(user_id, None)
-        except Exception as e:
-            logger.warning("Failed to clear embedding cache for %s: %s", user_id, e)
+        except Exception:
+            logger.exception("Failed to clear embedding cache for %s", user_id)
 
         return {"status": "ok", "message": f"Full reset for '{user_id}': graph, ChromaDB, and embedding cache cleared."}
-    except Exception as exc:
-        logger.error("Error resetting graph for %s: %s", user_id, exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception:
+        logger.exception("Error resetting graph for %s", user_id)
+        raise HTTPException(status_code=500, detail="Internal server error.")
 
 
 # ------------------------------------------------------------------
@@ -351,25 +371,40 @@ async def ingest_all(user_id: str) -> dict[str, Any]:
         result = ingest_all_files(inputs_dir, user_id)
         reset_memory_manager(user_id)
         return result
-    except Exception as exc:
-        logger.error("Ingestion error: %s", exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception:
+        logger.exception("Ingestion error for user %s", user_id)
+        raise HTTPException(status_code=500, detail="Internal server error.")
 
 
-@router.post("/ingest/{user_id}/{filename}")
+@router.post("/ingest/{user_id}/{filename:path}")
 async def ingest_single(user_id: str, filename: str) -> dict[str, Any]:
     """Ingest a single file from the inputs/ directory."""
-    inputs_dir = settings.data_dir.parent / "inputs"
-    file_path = inputs_dir / filename
+    _validate_user_id(user_id)
+
+    # --- Path traversal prevention ---
+    # 1. Validate filename format (whitelist of safe characters + extensions)
+    basename = filename.split("/")[-1] if "/" in filename else filename
+    if not _VALID_FILENAME.match(basename):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid filename. Only alphanumeric characters, hyphens, underscores, and supported extensions allowed.",
+        )
+
+    # 2. Resolve and verify the path stays inside inputs/
+    inputs_dir = (settings.data_dir.parent / "inputs").resolve()
+    file_path = (inputs_dir / filename).resolve()
+
+    if not str(file_path).startswith(str(inputs_dir)):
+        raise HTTPException(status_code=403, detail="Access denied.")
 
     if not file_path.exists():
-        raise HTTPException(status_code=404, detail=f"File not found: {filename}")
+        raise HTTPException(status_code=404, detail="File not found.")
 
     try:
         result = ingest_file(file_path, user_id)
         result.pop("graph_diff", None)
         reset_memory_manager(user_id)
         return result
-    except Exception as exc:
-        logger.error("Ingestion error for %s: %s", filename, exc, exc_info=True)
-        raise HTTPException(status_code=500, detail=str(exc))
+    except Exception:
+        logger.exception("Ingestion error for file %s", basename)
+        raise HTTPException(status_code=500, detail="Internal server error.")
